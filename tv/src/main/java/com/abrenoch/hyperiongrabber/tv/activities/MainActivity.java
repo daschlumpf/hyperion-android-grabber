@@ -26,18 +26,22 @@ import com.abrenoch.hyperiongrabber.common.BootActivity;
 import com.abrenoch.hyperiongrabber.common.HyperionScreenService;
 import com.abrenoch.hyperiongrabber.common.util.Preferences;
 import com.abrenoch.hyperiongrabber.tv.R;
+import android.provider.Settings;
+import android.net.Uri;
 
 public class MainActivity extends LeanbackActivity implements ImageView.OnClickListener,
         ImageView.OnFocusChangeListener {
     public static final int REQUEST_MEDIA_PROJECTION = 1;
     public static final int REQUEST_INITIAL_SETUP = 2;
+    private static final int REQUEST_OVERLAY_PERMISSION = 101;
+
     public static final String BROADCAST_ERROR = "SERVICE_ERROR";
     public static final String BROADCAST_TAG = "SERVICE_STATUS";
     public static final String BROADCAST_FILTER = "SERVICE_FILTER";
     private static final String TAG = "DEBUG";
     private boolean mRecorderRunning = false;
     private static MediaProjectionManager mMediaProjectionManager;
-
+    
     private BroadcastReceiver mMessageReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -59,7 +63,15 @@ public class MainActivity extends LeanbackActivity implements ImageView.OnClickL
             startSetup();
         }
 
+        //https://stackoverflow.com/questions/60699244/boot-completed-not-working-on-android-10-q-api-level-29
+        if (!Settings.canDrawOverlays(getApplicationContext())) {
+            Intent overlayIntent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION);
+            Uri uri = Uri.fromParts("package", getPackageName(), null);
 
+            overlayIntent.setData(uri);
+
+            startActivityForResult(overlayIntent, REQUEST_OVERLAY_PERMISSION);
+        }
     }
 
     /** @return whether the activity was initialized */
