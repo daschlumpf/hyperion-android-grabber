@@ -132,7 +132,7 @@ public class HyperionScreenService extends Service {
         Preferences prefs = new Preferences(getBaseContext());
         String host = prefs.getString(R.string.pref_key_host, null);
         int port = prefs.getInt(R.string.pref_key_port, -1);
-        String priority = prefs.getString(R.string.pref_key_priority, "50");
+        String priority = prefs.getString(R.string.pref_key_priority, "150");
         mFrameRate = prefs.getInt(R.string.pref_key_framerate);
         mHorizontalLEDCount = prefs.getInt(R.string.pref_key_x_led);
         mVerticalLEDCount = prefs.getInt(R.string.pref_key_y_led);
