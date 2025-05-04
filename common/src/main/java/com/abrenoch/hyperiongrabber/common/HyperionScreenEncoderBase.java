@@ -18,6 +18,7 @@ public class HyperionScreenEncoderBase {
 
     final boolean mRemoveBorders = false; // enables detecting borders for standard grabbing - disabled for now
     final boolean mAvgColor;
+    final boolean mUseLegacyImageReader;
     final int mWidthScaled;
     final int mFrameRate;
     final int mHeightScaled;
@@ -40,6 +41,7 @@ public class HyperionScreenEncoderBase {
         mDensity = density;
         mFrameRate = options.getFrameRate();
         mAvgColor = options.useAverageColor();
+        mUseLegacyImageReader = options.useLegacyImageReader();
 
         int blackThreshold = options.getBlackThreshold();
         mBorderProcessor = new BorderProcessor(blackThreshold);
@@ -132,13 +134,11 @@ public class HyperionScreenEncoderBase {
     }
 
     int getGrabberWidth() {
-        //return INIT_ORIENTATION != mCurrentOrientation ? mHeightScaled : mWidthScaled;
-        return 426;
+        return INIT_ORIENTATION != mCurrentOrientation ? mHeightScaled : mWidthScaled;
     }
 
     int getGrabberHeight() {
-        //return INIT_ORIENTATION != mCurrentOrientation ? mWidthScaled : mHeightScaled;
-        return 240;
+        return INIT_ORIENTATION != mCurrentOrientation ? mWidthScaled : mHeightScaled;
     }
 
     public void setOrientation(int orientation) {

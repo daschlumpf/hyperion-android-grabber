@@ -5,10 +5,24 @@
     <integer name="pref_default_port" translatable="false">19445</integer>
 
     <string name="pref_key_y_led" translatable="false">pref_key_y_led</string>
-    <integer name="pref_default_y_led" translatable="false">34</integer>
+    <!-- Best performance -->
+    <!-- <integer name="pref_default_y_led" translatable="false">9</integer> -->
+    <!-- <integer name="pref_default_y_led" translatable="false">36</integer> -->
+    <!-- <integer name="pref_default_y_led" translatable="false">36</integer> -->
+    <integer name="pref_default_y_led" translatable="false">180</integer>
+    <!-- <integer name="pref_default_y_led" translatable="false">240</integer> -->
+    <!-- <integer name="pref_default_y_led" translatable="false">1080</integer> -->
+    <!-- <integer name="pref_default_y_led" translatable="false">540</integer> -->
 
     <string name="pref_key_x_led" translatable="false">pref_key_x_led</string>
-    <integer name="pref_default_x_led" translatable="false">60</integer>
+    <!-- Best performance -->
+    <!-- <integer name="pref_default_x_led" translatable="false">16</integer> -->
+    <!-- <integer name="pref_default_x_led" translatable="false">64</integer> -->
+    <!-- <integer name="pref_default_x_led" translatable="false">46</integer> -->
+    <integer name="pref_default_x_led" translatable="false">320</integer>
+    <!-- <integer name="pref_default_x_led" translatable="false">426</integer> -->
+    <!-- <integer name="pref_default_x_led" translatable="false">1920</integer> -->
+    <!-- <integer name="pref_default_x_led" translatable="false">960</integer> -->
 
     <string name="pref_key_priority" translatable="false">pref_key_priority</string>
     <integer name="pref_default_priority" translatable="false">150</integer>
@@ -20,7 +34,7 @@
     <integer name="pref_default_reconnect_delay" translatable="false">5</integer>
 
     <string name="pref_key_boot" translatable="false">pref_key_start_on_boot</string>
-    <bool name="pref_default_boot" translatable="false">false</bool>
+    <bool name="pref_default_boot" translatable="false">true</bool>
 
     <string name="pref_key_framerate" translatable="false">pref_key_framerate</string>
     <integer name="pref_default_framerate" translatable="false">30</integer>
@@ -34,4 +48,7 @@
 
     <string name="pref_key_use_avg_color" translatable="false">pref_key_use_avg_color</string>
     <bool name="pref_default_use_avg_color" translatable="false">false</bool>
+
+    <string name="pref_key_use_legacy_image_reader" translatable="false">pref_key_use_legacy_image_reader</string>
+    <bool name="pref_default_use_legacy_image_reader" translatable="false">false</bool>
 </resources>

@@ -23,7 +23,9 @@ import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 
 public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
-    private static final int MAX_IMAGE_READER_IMAGES = 5;
+    //ImageReader-Buffergröße auf 2 oder 3 begrenzen
+    //Ein zu großer Buffer erhöht Latenz und RAM-Verbrauch:
+    private static final int MAX_IMAGE_READER_IMAGES = 7;
     private static final String TAG = "HyperionScreenEncoder";
     private static final boolean DEBUG = false;
     private VirtualDisplay mVirtualDisplay;
@@ -47,13 +49,22 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
     private void prepare() throws MediaCodec.CodecException {
         if (DEBUG) Log.d(TAG, "Preparing encoder");
 
+        int flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION;// | DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR;
+        flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
+        // flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
+        //   | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
+        flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR;
+        setImageReader();
+
         mVirtualDisplay = mMediaProjection.createVirtualDisplay(
                 TAG,
                 getGrabberWidth(), getGrabberHeight(), mDensity,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                flags,
                 null, mDisplayCallback, null);
 
-        setImageReader();
+        mVirtualDisplay.setSurface(mImageReader.getSurface());
+
+        //setImageReader();
     }
 
     @Override
@@ -82,17 +93,17 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         }
     }
 
-    @RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
-    @Override
-    public void setOrientation(int orientation) {
-        if (mVirtualDisplay != null && orientation != mCurrentOrientation) {
-            mCurrentOrientation = orientation;
-            mIsCapturing = false;
-            mVirtualDisplay.resize(getGrabberWidth(), getGrabberHeight(), mDensity);
-            mImageReader.close();
-            setImageReader();
-        }
-    }
+    // @RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
+    // @Override
+    // public void setOrientation(int orientation) {
+    //     if (mVirtualDisplay != null && orientation != mCurrentOrientation) {
+    //         mCurrentOrientation = orientation;
+    //         mIsCapturing = false;
+    //         mVirtualDisplay.resize(getGrabberWidth(), getGrabberHeight(), mDensity);
+    //         mImageReader.close();
+    //         setImageReader();
+    //     }
+    // }
 
     private VirtualDisplay.Callback mDisplayCallback = new VirtualDisplay.Callback() {
         @Override
@@ -122,15 +133,37 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
     @RequiresApi(api = Build.VERSION_CODES.KITKAT_WATCH)
     private void setImageReader() {
         if (DEBUG) Log.d(TAG, "Setting image reader  " + String.valueOf(isCapturing()));
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            mImageReader = ImageReader.newInstance(getGrabberWidth(), getGrabberHeight(),
-                    PixelFormat.RGBA_8888, MAX_IMAGE_READER_IMAGES, HardwareBuffer.USAGE_CPU_READ_OFTEN);
+
+        if (mImageReader != null) {
+            mImageReader.close();  // Release image reader
+            mImageReader = null;
+        }
+
+        int width = getGrabberWidth();
+        int height = getGrabberHeight();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !mUseLegacyImageReader) {
+            Log.i(TAG, "Using new image reader...");
+
+            mImageReader = ImageReader.newInstance(width, height,
+                    HardwareBuffer.RGBA_8888, MAX_IMAGE_READER_IMAGES, HardwareBuffer.USAGE_CPU_READ_OFTEN);
+            
         } else {
-            mImageReader = ImageReader.newInstance(getGrabberWidth(), getGrabberHeight(),
+            Log.i(TAG, "Using legacy image reader...");
+
+            mImageReader = ImageReader.newInstance(width, height,
                     PixelFormat.RGBA_8888, MAX_IMAGE_READER_IMAGES);
         }
+
+        scaledWidth = width / DOWNSCALE_FACTOR;
+        scaledHeight = height / DOWNSCALE_FACTOR;
+
+        rgbBuffer = new byte[scaledWidth * scaledHeight * 3];
+
+        Log.d(TAG, "rgbBuffer " + String.valueOf(scaledWidth * scaledHeight * 3));
+
         mImageReader.setOnImageAvailableListener(imageAvailableListener, mHandler);
-        mVirtualDisplay.setSurface(mImageReader.getSurface());
+        //mVirtualDisplay.setSurface(mImageReader.getSurface());
         setCapturing(true);
     }
 
@@ -145,12 +178,13 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
                 try {
                     long now = System.nanoTime();
                     Image img = reader.acquireLatestImage();
-                    if (img != null && now - lastFrame >= min_nano_time) {
-                        sendImage(img);
-                        img.close();
-                        lastFrame = now;
-                    } else if (img != null) {
-                        img.close();
+                    if (img != null) {
+                        // Nur Bild verarbeiten, wenn die Framerate seit dem letzten Frame überschritten ist
+                        if (now - lastFrame >= min_nano_time) {
+                            sendImage(img);
+                            lastFrame = now; // Zeitstempel des letzten verarbeiteten Frames
+                        }
+                        img.close(); // Bild nach der Verwendung schließen                        
                     }
                 } catch (final Exception e) {
                     if (DEBUG) Log.w(TAG, "sendImage exception:", e);
@@ -160,28 +194,30 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
     };
 
     private byte[] getPixels(ByteBuffer buffer, int width, int height, int rowStride,
-                             int pixelStride, int firstX, int firstY){
-        int rowPadding = rowStride - width * pixelStride;
-        int offset = 0;
+                         int pixelStride, int downscaleFactor) {
 
-        ByteArrayOutputStream bao = new ByteArrayOutputStream(
-                (width - firstX * 2) * (height - firstY * 2) * 3
-        );
+        int targetWidth = width  / downscaleFactor;
+        int targetHeight = height / downscaleFactor;
 
-        for (int y = 0, compareHeight = height - firstY - 1; y < height; y++, offset += rowPadding) {
-            if (y < firstY || y > compareHeight) {
-                offset += width * pixelStride;
-                continue;
-            }
-            for (int x = 0, compareWidth = width - firstX - 1; x < width; x++, offset += pixelStride) {
-                if (x < firstX || x > compareWidth) continue;
-                bao.write(buffer.get(offset) & 0xff); // R
-                bao.write(buffer.get(offset + 1) & 0xff); // G
-                bao.write(buffer.get(offset + 2) & 0xff); // B
+        int outputIndex = 0;
+
+        for (int y = 0; y < height ; y += downscaleFactor) {
+            int rowStart = y * rowStride;
+
+            for (int x = 0; x < width ; x += downscaleFactor) {
+                int pixelIndex = rowStart + x * pixelStride;
+
+                byte r = buffer.get(pixelIndex);       // R
+                byte g = buffer.get(pixelIndex + 1);   // G
+                byte b = buffer.get(pixelIndex + 2);   // B
+
+                rgbBuffer[outputIndex++] = r;
+                rgbBuffer[outputIndex++] = g;
+                rgbBuffer[outputIndex++] = b;
             }
         }
 
-        return bao.toByteArray();
+        return rgbBuffer;
     }
 
     private byte[] getAverageColor(ByteBuffer buffer, int width, int height, int rowStride,
@@ -214,7 +250,13 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         return bao.toByteArray();
     }
 
-    private void sendImage(Image img) {
+    int scaledWidth;
+    int scaledHeight;
+    private byte[] rgbBuffer;
+    private static final int DOWNSCALE_FACTOR = 10;
+
+    private void sendImage(Image img) 
+    {
         Image.Plane plane = img.getPlanes()[0];
         ByteBuffer buffer = plane.getBuffer();
 
@@ -223,29 +265,31 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         int pixelStride = plane.getPixelStride();
         int rowStride = plane.getRowStride();
         int firstX = 0;
-        int firstY = 0;
+        int firstY = 0;        
 
-        if (mRemoveBorders || mAvgColor) {
-            mBorderProcessor.parseBorder(buffer, width, height, rowStride, pixelStride);
-            BorderProcessor.BorderObject border = mBorderProcessor.getCurrentBorder();
-            if (border != null && border.isKnown()) {
-                firstX = border.getHorizontalBorderIndex();
-                firstY = border.getVerticalBorderIndex();
-            }
-        }
+        // if (mRemoveBorders || mAvgColor) {
+        //     mBorderProcessor.parseBorder(buffer, width, height, rowStride, pixelStride);
+        //     BorderProcessor.BorderObject border = mBorderProcessor.getCurrentBorder();
+        //     if (border != null && border.isKnown()) {
+        //         firstX = border.getHorizontalBorderIndex();
+        //         firstY = border.getVerticalBorderIndex();
+        //     }
+        // }
 
-        if (mAvgColor) {
+        // if (mAvgColor) {
+        //     mListener.sendFrame(
+        //             getAverageColor(buffer, width, height, rowStride, pixelStride, firstX, firstY),
+        //             1,
+        //             1
+        //     );
+        // } else 
+        {                     
+
             mListener.sendFrame(
-                    getAverageColor(buffer, width, height, rowStride, pixelStride, firstX, firstY),
-                    1,
-                    1
-            );
-        } else {
-            mListener.sendFrame(
-                    getPixels(buffer, width, height, rowStride, pixelStride, firstX, firstY),
-                    width - firstX * 2,
-                    height - firstY * 2
-            );
+                getPixels(buffer, width, height, rowStride, pixelStride, DOWNSCALE_FACTOR),
+                scaledWidth,
+                scaledHeight
+            );  
         }
     }
 }

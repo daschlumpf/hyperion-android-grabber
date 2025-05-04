@@ -145,6 +145,15 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
                 .checked(prefs.getBoolean(R.string.pref_key_use_avg_color))
                 .build()
 
+        val legacyImageReaderEnabled = prefs.getBoolean(R.string.pref_key_use_legacy_image_reader)
+
+        val legacyImageReader = GuidedAction.Builder(context)
+                .id(ACTION_USE_LEGACY_IMAGE_READER)
+                .title(getString(R.string.pref_title_use_legacy_image_reader))
+                .checkSetId(GuidedAction.CHECKBOX_CHECK_SET_ID)
+                .checked(legacyImageReaderEnabled)
+                .build()
+
         actions.add(enterHost)
         actions.add(enterPort)
         actions.add(enterHorizontalLEDCount)
@@ -155,6 +164,7 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
         actions.add(reconnectGroup)
         actions.add(captureRate)
         actions.add(averageColor)
+        actions.add(legacyImageReader)
 
     }
 
@@ -184,6 +194,7 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
                 val reconnect = findSubActionById(ACTION_RECONNECT)!!.isChecked
                 val reconnectDelay = assertIntValue(ACTION_RECONNECT_DELAY)
                 val useAverageColor = findActionById(ACTION_AVERAGE_COLOR)!!.isChecked
+                val useLegacyImageReader = findActionById(ACTION_USE_LEGACY_IMAGE_READER).isChecked
 
                 prefs.putString(R.string.pref_key_host, host)
                 prefs.putInt(R.string.pref_key_port, port)
@@ -195,6 +206,7 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
                 prefs.putString(R.string.pref_key_framerate, frameRate)
                 prefs.putBoolean(R.string.pref_key_reconnect, reconnect)
                 prefs.putBoolean(R.string.pref_key_use_avg_color, useAverageColor)
+                prefs.putBoolean(R.string.pref_key_use_legacy_image_reader, useLegacyImageReader)
 
                 val activity = activity
                 activity?.setResult(Activity.RESULT_OK)
@@ -260,7 +272,7 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
         private const val ACTION_PORT = 110L
         private const val ACTION_START_ON_BOOT = 120L
         private const val ACTION_X_LED_COUNT = 130L
-        private const val ACTION_Y_LED_COUNT = 140L
+        private const val ACTION_Y_LED_COUNT = 140L        
         private const val ACTION_RECONNECT_GROUP = 200L
         private const val ACTION_RECONNECT = 210L
         private const val ACTION_RECONNECT_DELAY = 220L
@@ -268,6 +280,7 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
         private const val ACTION_CAPTURE_RATE = 400L
         private const val ACTION_CAPTURE_RATE_SET_ID = 1500
         private const val ACTION_AVERAGE_COLOR = 600L
+        private const val ACTION_USE_LEGACY_IMAGE_READER = 610L
 
 
         private const val ACTION_TEST = 700L

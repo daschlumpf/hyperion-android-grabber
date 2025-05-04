@@ -50,6 +50,7 @@ public class HyperionScreenService extends Service {
     private int mHorizontalLEDCount;
     private int mVerticalLEDCount;
     private boolean mSendAverageColor;
+    private boolean mUseLegacyImageReader;
     private HyperionScreenEncoder mHyperionEncoder;
     private NotificationManager mNotificationManager;
     private String mStartError = null;
@@ -137,6 +138,7 @@ public class HyperionScreenService extends Service {
         mHorizontalLEDCount = prefs.getInt(R.string.pref_key_x_led);
         mVerticalLEDCount = prefs.getInt(R.string.pref_key_y_led);
         mSendAverageColor = prefs.getBoolean(R.string.pref_key_use_avg_color);
+        mUseLegacyImageReader = prefs.getBoolean(R.string.pref_key_use_legacy_image_reader);
         RECONNECT = prefs.getBoolean(R.string.pref_key_reconnect);
         int delay = prefs.getInt(R.string.pref_key_reconnect_delay);
         if (host == null || Objects.equals(host, "0.0.0.0") || Objects.equals(host, "")) {
@@ -259,7 +261,7 @@ public class HyperionScreenService extends Service {
             window.getDefaultDisplay().getRealMetrics(metrics);
             final int density = metrics.densityDpi;
             HyperionGrabberOptions options = new HyperionGrabberOptions(mHorizontalLEDCount,
-                    mVerticalLEDCount, mFrameRate, mSendAverageColor);
+                    mVerticalLEDCount, mFrameRate, mSendAverageColor, mUseLegacyImageReader);
             if (DEBUG) Log.v(TAG, "Starting the recorder");
             mHyperionEncoder = new HyperionScreenEncoder(mHyperionThread.getReceiver(),
                     projection, metrics.widthPixels, metrics.heightPixels,

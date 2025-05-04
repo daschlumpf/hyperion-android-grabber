@@ -27,7 +27,7 @@ android {
     compileSdkVersion 30
     defaultConfig {
         applicationId "com.abrenoch.hyperiongrabber"
-        minSdkVersion 21
+        minSdkVersion 26
         targetSdkVersion 30
         versionCode 2013
         versionName "1.1 BETA 1"
@@ -48,8 +48,8 @@ dependencies {
     implementation fileTree(include: ['*.jar'], dir: 'libs')
     implementation project(path: ':common')
 
-    implementation 'com.jakewharton:butterknife:10.0.0'
-    annotationProcessor 'com.jakewharton:butterknife-compiler:10.0.0'
+    implementation 'com.jakewharton:butterknife:10.2.3'
+    annotationProcessor 'com.jakewharton:butterknife-compiler:10.2.3'
     implementation "androidx.appcompat:appcompat:1.0.0"
     implementation "androidx.leanback:leanback:1.0.0"
     implementation "androidx.leanback:leanback-preference:1.0.0"
