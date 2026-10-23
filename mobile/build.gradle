@@ -5,24 +5,25 @@ apply from: project(':common').projectDir.absolutePath + '/variables.gradle'
 buildscript {
     repositories {
         google()
-        jcenter()
+        mavenCentral()
     }
 
     dependencies {
-        classpath 'com.android.tools.build:gradle:7.1.2'
+        classpath 'com.android.tools.build:gradle:8.5.2'
         classpath 'com.google.protobuf:protobuf-gradle-plugin:0.9.4'
     }
 }
 
 repositories {
-    jcenter()
+    mavenCentral()
     maven {
         url 'https://maven.google.com'
     }
 }
 
 android {
-    compileSdkVersion 30
+    namespace 'com.abrenoch.hyperiongrabber.mobile'
+    compileSdk 30
     defaultConfig {
         applicationId "com.abrenoch.hyperiongrabber"
         minSdkVersion 26

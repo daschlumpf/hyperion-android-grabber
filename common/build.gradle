@@ -8,17 +8,17 @@ apply from: project(':common').projectDir.absolutePath + '/variables.gradle'
 buildscript {
     repositories {
         google()
-        jcenter()
+        mavenCentral()
     }
 
     dependencies {
-        classpath 'com.android.tools.build:gradle:7.1.2'
-        classpath 'com.google.protobuf:protobuf-gradle-plugin:0.8.18'
+        classpath 'com.android.tools.build:gradle:8.5.2'
+        classpath 'com.google.protobuf:protobuf-gradle-plugin:0.9.4'
     }
 }
 
 repositories {
-    jcenter()
+    mavenCentral()
     maven {
         url 'https://maven.google.com'
     }
@@ -29,7 +29,8 @@ sourceSets {
 }
 
 android {
-    compileSdkVersion 30
+    namespace 'com.abrenoch.hyperiongrabber.common'
+    compileSdk 30
     defaultConfig {
         minSdkVersion 26
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
@@ -45,6 +46,9 @@ android {
     compileOptions {
         targetCompatibility JavaVersion.VERSION_1_8
         sourceCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions {
+        jvmTarget = '1.8'
     }
 }
 
@@ -85,3 +89,4 @@ protobuf {
         }
     }
 }
+
