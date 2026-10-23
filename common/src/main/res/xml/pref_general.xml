@@ -102,6 +102,12 @@
             android:title="@string/pref_title_use_avg_color"
             android:summary="@string/pref_summary_use_avg_color" />
 
+        <CheckBoxPreference
+            android:defaultValue="@bool/pref_default_drm_orange_fallback"
+            android:key="@string/pref_key_drm_orange_fallback"
+            android:title="@string/pref_title_drm_orange_fallback"
+            android:summary="@string/pref_summary_drm_orange_fallback" />
+
     </PreferenceCategory>
 
     <PreferenceCategory

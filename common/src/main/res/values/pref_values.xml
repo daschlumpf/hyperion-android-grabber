@@ -55,4 +55,7 @@
 
     <string name="pref_key_use_legacy_image_reader" translatable="false">pref_key_use_legacy_image_reader</string>
     <bool name="pref_default_use_legacy_image_reader" translatable="false">false</bool>
+
+    <string name="pref_key_drm_orange_fallback" translatable="false">pref_key_drm_orange_fallback</string>
+    <bool name="pref_default_drm_orange_fallback" translatable="false">true</bool>
 </resources>

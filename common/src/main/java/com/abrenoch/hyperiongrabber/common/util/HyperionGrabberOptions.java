@@ -10,9 +10,14 @@ public class HyperionGrabberOptions {
     private final int FRAME_RATE;
     private final boolean USE_AVERAGE_COLOR;
     private final boolean USE_LEGACY_IMAGE_READER;
+    private final boolean USE_DRM_ORANGE_FALLBACK;
     private final int BLACK_THRESHOLD = 5; // The limit each RGB value must be under to be considered a black pixel [0-255]
     private final String RESOLUTION;
     public HyperionGrabberOptions(int horizontalLED, int verticalLED, int frameRate, boolean useAvgColor, boolean useLegacyImageReader, String resolution) {
+        this(horizontalLED, verticalLED, frameRate, useAvgColor, useLegacyImageReader, resolution, true);
+    }
+
+    public HyperionGrabberOptions(int horizontalLED, int verticalLED, int frameRate, boolean useAvgColor, boolean useLegacyImageReader, String resolution, boolean useDrmOrangeFallback) {
 
         /*
         * To determine the minimal acceptable image packet size we take the count of the width & height
@@ -24,6 +29,7 @@ public class HyperionGrabberOptions {
         FRAME_RATE = frameRate;
         USE_AVERAGE_COLOR = useAvgColor;
         USE_LEGACY_IMAGE_READER = useLegacyImageReader;
+        USE_DRM_ORANGE_FALLBACK = useDrmOrangeFallback;
         RESOLUTION = resolution;
 
         if (DEBUG) {
@@ -38,6 +44,8 @@ public class HyperionGrabberOptions {
     public boolean useAverageColor() { return USE_AVERAGE_COLOR; }
 
     public boolean useLegacyImageReader() { return USE_LEGACY_IMAGE_READER; }
+
+    public boolean useDrmOrangeFallback() { return USE_DRM_ORANGE_FALLBACK; }
 
     public String Resolution() { return RESOLUTION; }
     /**

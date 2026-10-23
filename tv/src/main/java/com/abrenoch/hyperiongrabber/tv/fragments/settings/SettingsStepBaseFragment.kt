@@ -49,14 +49,15 @@ internal abstract class SettingsStepBaseFragment : GuidedStepSupportFragment() {
                 .build()
     }
 
-    protected fun unSignedNumberAction(id: Long, title: String, description: CharSequence?): GuidedAction {
+    protected fun unSignedNumberAction(id: Long, title: String, description: CharSequence?, enabled: Boolean = true): GuidedAction {
         return GuidedAction.Builder(context)
                 .id(id)
                 .title(title)
                 .description(description)
-                .descriptionEditable(true)
+                .descriptionEditable(enabled)
                 .descriptionInputType(InputType.TYPE_CLASS_NUMBER)
                 .descriptionEditInputType(InputType.TYPE_CLASS_NUMBER)
+                .enabled(enabled)
                 .build()
 
     }

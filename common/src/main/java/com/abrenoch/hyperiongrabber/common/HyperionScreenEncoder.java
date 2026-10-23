@@ -219,9 +219,16 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         // [deepseek] the capture size and the buffers below hold a full uncompressed RGB frame.
         // [deepseek] Allocate both ping-pong frame buffers up front so the capture loop never
         // [deepseek] allocates memory per frame (avoids GC pressure on weak TV hardware).
-        mRgbBuffer = new byte[mScaledWidth * mScaledHeight * 3];
+                mRgbBuffer = new byte[mScaledWidth * mScaledHeight * 3];
         mRgbBufferAlt = new byte[mScaledWidth * mScaledHeight * 3];
         mUseAltBuffer = false;
+        // [drmsample] The orange buffer is sized to the scaled dimensions, so it must be rebuilt
+        // [drmsample] whenever the capture size changes; also reset the detection state so a
+        // [drmsample] restart begins with a clean slate.
+        mOrangeBuffer = null;
+        mBlackFrameCount = 0;
+        mBrightFrameCount = 0;
+        mSendingOrange = false;
         // [deepseek] One full RGBA row of the source image, reused for every row of every frame.
         mRowBuffer = new byte[width * 4];
 
@@ -279,11 +286,12 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         if (elapsed < STATS_INTERVAL_NS) return;
 
         final double seconds = elapsed / 1e9;
-        Log.i(TAG, String.format(Locale.US,
-                "Stats: %d images, %d sent in %.1f s -> %.1f img/s producer, %.1f fps sent, ratio %.2f:1",
+                Log.i(TAG, String.format(Locale.US,
+                "Stats: %d images, %d sent in %.1f s -> %.1f img/s producer, %.1f fps sent, ratio %.2f:1 drmFallback=%s",
                 mUniqueImages, mFramesSent, seconds,
                 mUniqueImages / seconds, mFramesSent / seconds,
-                mFramesSent == 0 ? 0.0 : (double) mUniqueImages / mFramesSent));
+                mFramesSent == 0 ? 0.0 : (double) mUniqueImages / mFramesSent,
+                mSendingOrange ? "ON" : "off"));
         mUniqueImages = 0;
         mFramesSent = 0;
         mStatsStartTime = System.nanoTime();
@@ -337,48 +345,179 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
     };
 
     private byte[] getPixels(ByteBuffer buffer, int width, int height, int rowStride, int pixelStride, int downscaleFactor) 
-    {  
+    {
         // [deepseek] Alternate between the two frame buffers so the buffer that was handed to the
         // [deepseek] network thread is never overwritten while it is still being serialized/sent.
         final byte[] out = mUseAltBuffer ? mRgbBufferAlt : mRgbBuffer;
         mUseAltBuffer = !mUseAltBuffer;
         int outputIndex = 0;
 
-        // [deepseek] Fast path: tightly packed RGBA rows (pixelStride == 4, no row padding).
-        // [deepseek] One bulk get() per row replaces three bounds-checked absolute get() calls
-        // [deepseek] per pixel, which is the dominant cost of the whole capture pipeline.
-        if (pixelStride == 4 && rowStride == width * 4) {
-            final byte[] row = mRowBuffer;
-            for (int y = 0; y < height; y += downscaleFactor) {
-                buffer.position(y * rowStride);
-                buffer.get(row, 0, rowStride);
+        // [drmsample] Brightness probe for DRM detection. We do NOT do a second pass over the
+        // [drmsample] image: instead we sample a fixed grid of positions while the existing copy
+        // [drmsample] loop is already touching every pixel, so the extra cost is a couple of
+        // [drmsample] comparisons per row/column - no measurable impact.
+        // [drmsample] A sampled pixel counts as "bright" when any of R,G,B is clearly above black.
+        // [drmsample] Real content almost always has some non-black pixel in the grid; a protected
+        // [drmsample] layer that the compositor replaces with black produces an all-black grid.
+        int sampleMax = 0;
+        int brightSamples = 0;
+        int sampleCount = 0;
+        // [drmsample] Skip the probing entirely when the user disabled the fallback, so a disabled
+        // [drmsample] feature costs literally nothing in the copy loop.
+        final boolean doSampling = mDrmOrangeFallback;
 
-                for (int x = 0, src = 0; x < width; x += downscaleFactor, src += 4 * downscaleFactor) {
-                    out[outputIndex++] = row[src];
-                    out[outputIndex++] = row[src + 1];
-                    out[outputIndex++] = row[src + 2];
+        // [deepseek] Path selection: the fast path handles tightly packed RGBA rows (pixelStride == 4,
+        // [deepseek] no row padding) with one bulk get() per row; the fallback handles padded rows or
+        // [deepseek] an unusual pixel stride with per-pixel absolute reads. Only the addressing of a
+        // [deepseek] single pixel differs, so both share the loop below.
+        final boolean bulkRowRead = pixelStride == 4 && rowStride == width * 4;
+        final byte[] row = bulkRowRead ? mRowBuffer : null;
+
+        for (int y = 0; y < height; y += downscaleFactor)
+        {
+            final int rowStart = y * rowStride;
+            // [drmsample] Only probe every SAMPLE_STEP-th source row.
+            final boolean sampleRow = doSampling && (y % SAMPLE_STEP) == 0;
+
+            if (bulkRowRead)
+            {
+                // [deepseek] FAST PATH: read the whole padded-free RGBA row in one bulk get(); the
+                // [deepseek] inner loop then only touches the scratch row instead of the ByteBuffer.
+                buffer.position(rowStart);
+                buffer.get(row, 0, rowStride);
+            }
+
+            for (int x = 0, src = 0; x < width; x += downscaleFactor, src += pixelStride * downscaleFactor)
+            {
+                final byte r;
+                final byte g;
+                final byte b;
+                if (bulkRowRead) 
+                {
+                    // [deepseek] FAST PATH: pixel comes from the already materialized row buffer.
+                    r = row[src];
+                    g = row[src + 1];
+                    b = row[src + 2];
+                } 
+                else 
+                {
+                    // [deepseek] FALLBACK PATH: per-pixel absolute reads honour row padding and stride.
+                    final int pixelIndex = rowStart + src;
+                    r = buffer.get(pixelIndex);
+                    g = buffer.get(pixelIndex + 1);
+                    b = buffer.get(pixelIndex + 2);
+                }
+
+                out[outputIndex++] = r;
+                out[outputIndex++] = g;
+                out[outputIndex++] = b;
+
+                if (sampleRow && (x % SAMPLE_STEP) == 0) 
+                {
+                    final int rr = r & 0xFF;
+                    final int gg = g & 0xFF;
+                    final int bb = b & 0xFF;
+                    final int max = rr > gg ? (rr > bb ? rr : bb) : (gg > bb ? gg : bb);
+                    if (max > sampleMax) sampleMax = max;
+                    if (max > BLACK_SAMPLE_THRESHOLD) brightSamples++;
+                    sampleCount++;
                 }
             }
-            return out;
         }
 
-        // [deepseek] Fallback: padded rows or an unusual pixel stride, handled with the original
-        // [deepseek] per-pixel absolute reads.
-        for (int y = 0; y < height; y += downscaleFactor) 
-        {
-            int rowStart = y * rowStride;
-            
-            for (int x = 0; x < width; x += downscaleFactor) 
-            {                
-                int pixelIndex = rowStart + x * pixelStride;   
-                
-                out[outputIndex++] = buffer.get(pixelIndex);
-                out[outputIndex++] = buffer.get(pixelIndex + 1);
-                out[outputIndex++] = buffer.get(pixelIndex + 2);
+        updateDrmState(sampleMax, brightSamples, sampleCount);
+        return out;
+    }
+
+    // [drmsample] --- DRM / protected-content detection --------------------------------
+    // [drmsample] Thresholds are intentionally conservative: a pixel is "not black" when its
+    // [drmsample] brightest channel is above BLACK_SAMPLE_THRESHOLD. The sum of all sampled pixels
+    // [drmsample] has to stay below BLACK_FRAME_MAX for a frame to count as black.
+    private static final int BLACK_SAMPLE_THRESHOLD = 24;
+    // [drmsample] Sampling stride in *source* pixels. 16 means every 16th row and every 16th
+    // [drmsample] column of the capture image is probed - on 1280x720 that is ~80x45 = 3600 probes
+    // [drmsample] out of 921k pixels, i.e. 0.4%.
+    private static final int SAMPLE_STEP = 16;
+    // [drmsample] Number of consecutive black frames before the orange fallback kicks in.
+    // [drmsample] At 30 fps this is ~0.33 s, short enough to hide scene cuts (which have dark frames)
+    // [drmsample] and long enough not to react to a single fade frame.
+    private static final int BLACK_FRAMES_BEFORE_ORANGE = 10;
+    // [drmsample] Number of consecutive bright frames before returning to normal capture.
+    private static final int BRIGHT_FRAMES_BEFORE_NORMAL = 3;
+    // [drmsample] Orange in RGB (255, 140, 0).
+    private static final byte ORANGE_R = (byte) 0xFF;
+    private static final byte ORANGE_G = (byte) 0x8C;
+    private static final byte ORANGE_B = (byte) 0x00;
+
+    private int mBlackFrameCount;
+    private int mBrightFrameCount;
+    private boolean mSendingOrange;
+    // [drmsample] Orange frame buffer, reused; same size as the RGB frame buffers so sendFrame()
+    // [drmsample] can take the exact same width/height.
+    private byte[] mOrangeBuffer;
+
+    /**
+     * Updates the black/bright frame counters from one frame's sampling result and switches the
+     * DRM orange fallback on/off accordingly. Called from getPixels() with the values collected
+     * during the normal pixel copy, so no additional image pass is required.
+     *
+     * @param sampleMax    highest channel value seen in the sample grid
+     * @param brightSamples number of sampled pixels above BLACK_SAMPLE_THRESHOLD
+     * @param sampleCount  total number of sampled pixels
+     */
+    private void updateDrmState(int sampleMax, int brightSamples, int sampleCount) {
+        // [drmsample] Feature toggle from the settings screen. When disabled the counters stay at
+        // [drmsample] zero and sendImage() always forwards the real frame.
+        if (!mDrmOrangeFallback) {
+            mBlackFrameCount = 0;
+            mBrightFrameCount = 0;
+            mSendingOrange = false;
+            return;
+        }
+        if (sampleCount == 0) return;
+
+        final boolean black = brightSamples == 0;
+
+        if (black) {
+            mBrightFrameCount = 0;
+            if (mBlackFrameCount < Integer.MAX_VALUE) mBlackFrameCount++;
+            if (!mSendingOrange && mBlackFrameCount >= BLACK_FRAMES_BEFORE_ORANGE) {
+                mSendingOrange = true;
+                Log.i(TAG, "DRM fallback ON: " + mBlackFrameCount
+                        + " consecutive black frames (max channel " + sampleMax + "), sending orange");
+            }
+        } else {
+            mBlackFrameCount = 0;
+            if (mSendingOrange) {
+                mBrightFrameCount++;
+                if (mBrightFrameCount >= BRIGHT_FRAMES_BEFORE_NORMAL) {
+                    mSendingOrange = false;
+                    mBrightFrameCount = 0;
+                    Log.i(TAG, "DRM fallback OFF: content visible again ("
+                            + brightSamples + "/" + sampleCount + " sampled pixels bright)");
+                }
             }
         }
+    }
 
-        return out;
+    /** @return true if the last sampled frame was judged to be a protected/black frame */
+    private boolean isSendingOrange() {
+        return mSendingOrange;
+    }
+
+    /** Builds (once) and returns the solid orange frame buffer. */
+    private byte[] getOrangeBuffer() {
+        if (mOrangeBuffer == null) {
+            final int pixels = mScaledWidth * mScaledHeight;
+            final byte[] buf = new byte[pixels * 3];
+            for (int i = 0; i < pixels; i++) {
+                buf[i * 3] = ORANGE_R;
+                buf[i * 3 + 1] = ORANGE_G;
+                buf[i * 3 + 2] = ORANGE_B;
+            }
+            mOrangeBuffer = buf;
+        }
+        return mOrangeBuffer;
     }
 
     private byte[] getAverageColor(ByteBuffer buffer, int width, int height, int rowStride,
@@ -435,7 +574,7 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         //     }
         // }
 
-        // if (mAvgColor) {
+                // if (mAvgColor) {
         //     mListener.sendFrame(
         //             getAverageColor(buffer, width, height, rowStride, pixelStride, firstX, firstY),
         //             1,
@@ -443,12 +582,19 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         //     );
         // } else 
         {                     
+            // [drmsample] Always run the pixel copy: it updates the black/bright counters that
+            // [drmsample] drive the DRM fallback, so the detection costs nothing extra here.
+            final byte[] pixels = getPixels(buffer, width, height, rowStride, pixelStride, mDownscaleFactor);
 
-            mListener.sendFrame(
-                getPixels(buffer, width, height, rowStride, pixelStride, mDownscaleFactor),
-                mScaledWidth,
-                mScaledHeight
-            );  
+            // [drmsample] While a protected (DRM) layer hides the real content, the compositor only
+            // [drmsample] hands us black frames. In that case send a solid orange image instead of
+            // [drmsample] the meaningless black frame, so the LEDs show a defined state rather than
+            // [drmsample] staying dark.
+            if (isSendingOrange()) {
+                mListener.sendFrame(getOrangeBuffer(), mScaledWidth, mScaledHeight);
+            } else {
+                mListener.sendFrame(pixels, mScaledWidth, mScaledHeight);
+            }
         }
     }
 }

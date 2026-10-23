@@ -75,16 +75,22 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
         )
         // [deepseek] End of resolution summary fix.
 
+        // [drmsample] The LED pixel counts are not used for the transmitted image anymore: the
+        // [drmsample] grabber forwards the captured resolution 1:1 (PASSTHROUGH_1_TO_1) and lets
+        // [drmsample] the Hyperion server do the averaging. The actions stay in the list so existing
+        // [drmsample] configs keep working, but they are shown as disabled and not editable.
         val enterHorizontalLEDCount = unSignedNumberAction(
                 ACTION_X_LED_COUNT,
                 getString(R.string.pref_title_x_led),
-                prefs.getInt(R.string.pref_key_x_led).toString()
+                prefs.getInt(R.string.pref_key_x_led).toString(),
+                false
         )
 
         val enterVerticalLEDCount = unSignedNumberAction(
                 ACTION_Y_LED_COUNT,
                 getString(R.string.pref_title_y_led),
-                prefs.getInt(R.string.pref_key_y_led).toString()
+                prefs.getInt(R.string.pref_key_y_led).toString(),
+                false
         )
 
         val startOnBootEnabled = prefs.getBoolean(R.string.pref_key_boot)
@@ -185,6 +191,15 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
                 .checked(legacyImageReaderEnabled)
                 .build()
 
+        // [drmsample] Sends a solid orange image while DRM protected content hides the screen.
+        val drmOrangeFallback = GuidedAction.Builder(context)
+                .id(ACTION_DRM_ORANGE_FALLBACK)
+                .title(getString(R.string.pref_title_drm_orange_fallback))
+                .description(R.string.pref_summary_drm_orange_fallback)
+                .checkSetId(GuidedAction.CHECKBOX_CHECK_SET_ID)
+                .checked(prefs.getBoolean(R.string.pref_key_drm_orange_fallback))
+                .build()
+
         actions.add(enterHost)
         actions.add(enterPort)
         actions.add(resolution)
@@ -197,6 +212,7 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
         actions.add(captureRate)
         actions.add(averageColor)
         actions.add(legacyImageReader)
+        actions.add(drmOrangeFallback)
 
     }
 
@@ -219,8 +235,11 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
                 val host = assertStringValue(ACTION_HOST_NAME)
                 val port = assertIntValue(ACTION_PORT)
                 val resolution = assertSubActionValue(ACTION_RESOLUTION, String::class.java)
-                val xLED = assertIntValue(ACTION_X_LED_COUNT)
-                val yLED = assertIntValue(ACTION_Y_LED_COUNT)
+                // [drmsample] Horizontal/vertical LED count actions are disabled in the UI, so read
+                // [drmsample] the stored values instead of asserting the (non editable) fields. This
+                // [drmsample] keeps the old configuration intact and cannot fail on an empty field.
+                val xLED = prefs.getInt(R.string.pref_key_x_led)
+                val yLED = prefs.getInt(R.string.pref_key_y_led)
                 val startOnBootEnabled = findActionById(ACTION_START_ON_BOOT).isChecked
                 val priority = assertIntValue(ACTION_MESSAGE_PRIORITY)
                 val frameRate = assertSubActionValue(ACTION_CAPTURE_RATE, String::class.java)
@@ -228,6 +247,7 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
                 val reconnectDelay = assertIntValue(ACTION_RECONNECT_DELAY)
                 val useAverageColor = findActionById(ACTION_AVERAGE_COLOR)!!.isChecked
                 val useLegacyImageReader = findActionById(ACTION_USE_LEGACY_IMAGE_READER).isChecked
+                val useDrmOrangeFallback = findActionById(ACTION_DRM_ORANGE_FALLBACK).isChecked
 
                 prefs.putString(R.string.pref_key_host, host)
                 prefs.putInt(R.string.pref_key_port, port)
@@ -241,6 +261,7 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
                 prefs.putBoolean(R.string.pref_key_reconnect, reconnect)
                 prefs.putBoolean(R.string.pref_key_use_avg_color, useAverageColor)
                 prefs.putBoolean(R.string.pref_key_use_legacy_image_reader, useLegacyImageReader)
+                prefs.putBoolean(R.string.pref_key_drm_orange_fallback, useDrmOrangeFallback)
 
                 val activity = activity
                 activity?.setResult(Activity.RESULT_OK)
@@ -317,6 +338,7 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
         private const val ACTION_CAPTURE_RATE_SET_ID = 1500
         private const val ACTION_AVERAGE_COLOR = 600L
         private const val ACTION_USE_LEGACY_IMAGE_READER = 610L
+        private const val ACTION_DRM_ORANGE_FALLBACK = 620L
 
 
         private const val ACTION_TEST = 700L

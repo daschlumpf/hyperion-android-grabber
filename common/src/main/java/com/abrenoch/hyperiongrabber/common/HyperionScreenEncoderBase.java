@@ -17,8 +17,11 @@ public class HyperionScreenEncoderBase {
     private final int INIT_ORIENTATION;
 
         final boolean mRemoveBorders = false; // enables detecting borders for standard grabbing - disabled for now
-    final boolean mAvgColor;
-    final boolean mUseLegacyImageReader;
+        final boolean mAvgColor;
+        final boolean mUseLegacyImageReader;
+        // [drmsample] When enabled, black frames (typical for DRM protected content) are replaced by a
+        // [drmsample] solid orange image instead of being sent to Hyperion.
+        final boolean mDrmOrangeFallback;
         // [deepseek] Two distinct sizes are involved and they must not be confused:
     // [deepseek]   mCaptureWidth/mCaptureHeight = size of the VirtualDisplay and of the ImageReader
     // [deepseek]                                 (derived from the resolution preference).
@@ -50,9 +53,10 @@ public class HyperionScreenEncoderBase {
         mMediaProjection = projection;
         mDensity = density;
         mFrameRate = options.getFrameRate();
-        mAvgColor = options.useAverageColor();
+                mAvgColor = options.useAverageColor();
         String resolution = options.Resolution();
         mUseLegacyImageReader = options.useLegacyImageReader();
+        mDrmOrangeFallback = options.useDrmOrangeFallback();
 
         int blackThreshold = options.getBlackThreshold();
         mBorderProcessor = new BorderProcessor(blackThreshold);
