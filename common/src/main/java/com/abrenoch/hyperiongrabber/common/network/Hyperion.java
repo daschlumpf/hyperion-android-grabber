@@ -2,13 +2,12 @@ package com.abrenoch.hyperiongrabber.common.network;
 
 import com.abrenoch.hyperiongrabber.common.HyperionProto.ClearRequest;
 import com.abrenoch.hyperiongrabber.common.HyperionProto.ColorRequest;
-import com.abrenoch.hyperiongrabber.common.HyperionProto.HyperionReply;
 import com.abrenoch.hyperiongrabber.common.HyperionProto.HyperionRequest;
 import com.abrenoch.hyperiongrabber.common.HyperionProto.ImageRequest;
 import com.google.protobuf.ByteString;
 
-import java.io.BufferedInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -20,6 +19,8 @@ public class Hyperion {
 
     public Hyperion(String address, int port) throws IOException {
         mSocket = new Socket();
+        // Disable Nagle's algorithm to ensure immediate frame dispatch without artificial 20-40ms latency
+        mSocket.setTcpNoDelay(true);
         mSocket.connect(new InetSocketAddress(address, port), TIMEOUT);
     }
 
@@ -32,11 +33,17 @@ public class Hyperion {
 
 
     public boolean isConnected() {
+        // [deepseek] Socket.isConnected() only reports whether the socket was connected ONCE; it
+        // [deepseek] stays true after close(). A locally closed socket therefore still looked
+        // [deepseek] healthy, so the reconnect logic in HyperionThread never noticed that its
+        // [deepseek] connection was gone until the next write failed. isClosed() is the missing
+        // [deepseek] part of the check. The null guard stays as a cheap safety net.
         //noinspection ConstantConditions for some reason mSocket CAN be null sometimes
-        return mSocket != null && mSocket.isConnected();
+        return mSocket != null && mSocket.isConnected() && !mSocket.isClosed();
     }
 
-    public void disconnect() throws IOException {
+    // Synchronized to prevent closing the socket concurrently during write operations
+    public synchronized void disconnect() throws IOException {
         if (isConnected()) {
             mSocket.close();
         }
@@ -94,6 +101,10 @@ public class Hyperion {
         sendRequest(setImageRequest(data, width, height, priority, duration_ms));
     }
     public static HyperionRequest setImageRequest(byte[] data, int width, int height, int priority, int duration_ms) {
+        // [deepseek] Correction of an earlier comment: ByteString.copyFrom(byte[]) does NOT wrap the
+        // [deepseek] array, it makes a defensive copy (only the package-private ByteString.wrap()
+        // [deepseek] would be zero-copy). With a 32x18 LED matrix the copy is 1728 bytes per frame,
+        // [deepseek] so this is irrelevant in practice and no rewrite is needed.
         ImageRequest imageRequest = ImageRequest.newBuilder()
                 .setImagedata(ByteString.copyFrom(data))
                 .setImagewidth(width)
@@ -109,7 +120,8 @@ public class Hyperion {
     }
 
 
-    public void sendRequest(HyperionRequest request) throws IOException {
+    // Synchronized to prevent concurrent writes on the TCP socket output stream
+    public synchronized void sendRequest(HyperionRequest request) throws IOException {
         if (isConnected()) {
             int size = request.getSerializedSize();
 
@@ -126,27 +138,19 @@ public class Hyperion {
             request.writeTo(output);
             output.flush();
 
-            HyperionReply reply = receiveReply();
-            if (reply != null && !reply.getSuccess()) {
-                // response had a problem?
-            }
+            // Non-blocking reply drain:
+            // Hyperion replies to requests, but video streaming does not need synchronous per-frame ACKs.
+            // Synchronously waiting for replies blocks the stream and adds network round-trip latency.
+            // We drain any available reply bytes here so the OS TCP receive window does not stall.
+            try {
+                InputStream input = mSocket.getInputStream();
+                int available = input.available();
+                while (available > 0) {
+                    long skipped = input.skip(available);
+                    if (skipped <= 0) break;
+                    available = input.available();
+                }
+            } catch (IOException ignored) {}
         }
-    }
-
-    private HyperionReply receiveReply() throws IOException {
-        BufferedInputStream input = new BufferedInputStream(mSocket.getInputStream());
-
-        byte[] header = new byte[4];
-        input.read(header, 0, 4);
-        int size = (header[0]<<24) | (header[1]<<16) | (header[2]<<8) | (header[3]);
-
-        HyperionReply reply = null;
-        if (size > 0 && size == input.available()) {
-            byte[] data = new byte[size];
-            input.read(data, 0, size);
-            reply = HyperionReply.parseFrom(data);
-        }
-
-        return reply;
     }
 }

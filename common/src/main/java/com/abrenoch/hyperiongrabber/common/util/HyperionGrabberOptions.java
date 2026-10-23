@@ -1,9 +1,6 @@
 package com.abrenoch.hyperiongrabber.common.util;
 
 import android.util.Log;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.ListIterator;
 
 public class HyperionGrabberOptions {
     private static final boolean DEBUG = false;
@@ -14,8 +11,8 @@ public class HyperionGrabberOptions {
     private final boolean USE_AVERAGE_COLOR;
     private final boolean USE_LEGACY_IMAGE_READER;
     private final int BLACK_THRESHOLD = 5; // The limit each RGB value must be under to be considered a black pixel [0-255]
-
-    public HyperionGrabberOptions(int horizontalLED, int verticalLED, int frameRate, boolean useAvgColor, boolean useLegacyImageReader) {
+    private final String RESOLUTION;
+    public HyperionGrabberOptions(int horizontalLED, int verticalLED, int frameRate, boolean useAvgColor, boolean useLegacyImageReader, String resolution) {
 
         /*
         * To determine the minimal acceptable image packet size we take the count of the width & height
@@ -27,6 +24,7 @@ public class HyperionGrabberOptions {
         FRAME_RATE = frameRate;
         USE_AVERAGE_COLOR = useAvgColor;
         USE_LEGACY_IMAGE_READER = useLegacyImageReader;
+        RESOLUTION = resolution;
 
         if (DEBUG) {
             Log.d(TAG, "Horizontal LED Count: " + String.valueOf(horizontalLED));
@@ -41,6 +39,7 @@ public class HyperionGrabberOptions {
 
     public boolean useLegacyImageReader() { return USE_LEGACY_IMAGE_READER; }
 
+    public String Resolution() { return RESOLUTION; }
     /**
     * returns the divisor best suited to be used to meet the minimum image packet size
     *     Since we only want to scale using whole numbers, we need to find what common divisors
@@ -52,36 +51,16 @@ public class HyperionGrabberOptions {
     * @return int The divisor bes suited to scale the screen dimensions by
     **/
     public int findDivisor(int width, int height) {
-        List<Integer> divisors = getCommonDivisors(width, height);
-        if (DEBUG) Log.d(TAG, "Available Divisors: " + divisors.toString());
-        ListIterator it = divisors.listIterator(divisors.size());
-
-        // iterate backwards since the divisors are listed largest to smallest
-        while (it.hasPrevious()) {
-            int i = (int) it.previous();
-
-            // check if the image packet size for this divisor is >= the minimum image packet size
-            // like above we multiply the dimensions together and then by 3 for each byte in RGB
-            if ((width / i) * (height / i) * 3 >= MINIMUM_IMAGE_PACKET_SIZE)
-                return i;
+        // [deepseek] Iterate downwards from the largest possible divisor and return the first one
+        // [deepseek] that still yields at least the minimum image packet size. This replaces the
+        // [deepseek] old implementation that built a full ArrayList of common divisors on every
+        // [deepseek] call; it now runs allocation-free and stops at the first match.
+        int min = Math.min(width, height);
+        for (int i = min; i > 1; i--) {
+            if (width % i != 0 || height % i != 0) continue;
+            if ((width / i) * (height / i) * 3 >= MINIMUM_IMAGE_PACKET_SIZE) return i;
         }
         return 1;
-    }
-
-    /**
-     * gets a list of all the common divisors [large to small] for the given integers.
-     * @param num1 The first integer to find a whole number divisor for
-     * @param num2  The second integer to find a whole number divisor for
-     * @return List A list of the common divisors [large to small] that match the provided integers
-     **/
-    private static List<Integer> getCommonDivisors(int num1, int num2) {
-        List<Integer> list = new ArrayList<>();
-        int min = Math.min(num1, num2);
-        for (int i = 1; i <= min / 2; i++)
-            if (num1 % i == 0 && num2 % i == 0)
-                list.add(i);
-        if (num1 % min == 0 && num2 % min == 0) list.add(min);
-        return list;
     }
 
     public int getBlackThreshold() { return BLACK_THRESHOLD; }

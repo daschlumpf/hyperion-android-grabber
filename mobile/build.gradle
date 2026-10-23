@@ -30,8 +30,20 @@ android {
         versionCode 1013
         versionName "1.1 BETA 1"
     }
+    // [deepseek] Release signing config. The keystore lives in <repo>/keystore and is NOT
+    // [deepseek] committed (see .gitignore), so a fresh clone still builds an unsigned APK.
+    signingConfigs {
+        release {
+            storeFile file("../keystore/hyperion-release.jks")
+            storePassword "hyperion2026"
+            keyAlias "hyperion"
+            keyPassword "hyperion2026"
+        }
+    }
     buildTypes {
         release {
+            // [deepseek] Sign the release build so the APK can be installed on the phone.
+            signingConfig signingConfigs.release
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }

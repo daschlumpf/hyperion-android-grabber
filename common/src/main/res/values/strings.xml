@@ -7,6 +7,16 @@
     <item>30 fps</item>
     <item>60 fps</item>
   </string-array>
+  <string-array name="pref_list_resolution">
+    <!-- [deepseek] 80x45 is a halving of 160x90 and the smallest capture size on offer. -->
+    <item>80x45</item>
+    <item>160x90</item>
+    <item>240x135</item>
+    <item>320x180</item>
+    <item>640x360</item>
+    <item>1280x720</item>
+    <item>1920x1080</item>
+  </string-array>
   <string name="app_name">Hyperion Grabber</string>
   <string name="pref_title">Settings</string>
   <string name="enabled">Enabled</string>
@@ -47,7 +57,9 @@
   <!-- Capturing settings -->
   <string name="pref_group_capturing">Capturing</string>
   <string name="pref_title_framerate">Capture Rate</string>
+  <string name="pref_title_resolution">Resolution</string>
   <string name="pref_summary_framerate">Frames per second in which to send data to hyperion</string>
+  <string name="pref_summary_resolution">Resolution used for the virtual display</string>
   <!-- General settings -->
   <string name="pref_group_general">General</string>
   <string name="pref_summary_boot">Start screen grabber when device starts</string>

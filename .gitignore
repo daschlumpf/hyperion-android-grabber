@@ -9,3 +9,8 @@
 /build
 /captures
 .externalNativeBuild
+
+/common/***/*.class
+
+# [deepseek] Never commit the release keystore or its credentials.
+/keystore/

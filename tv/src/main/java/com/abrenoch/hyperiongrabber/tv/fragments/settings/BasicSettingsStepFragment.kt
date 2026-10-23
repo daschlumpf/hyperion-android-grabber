@@ -12,6 +12,7 @@ import com.abrenoch.hyperiongrabber.common.network.Hyperion
 import com.abrenoch.hyperiongrabber.tv.R
 import java.lang.ref.WeakReference
 import java.net.UnknownHostException
+import android.util.Log
 
 internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
 
@@ -43,6 +44,36 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
                 getString(R.string.pref_title_port),
                 prefs.getInt(R.string.pref_key_port).toString()
         )
+
+        // [deepseek] Show the currently stored resolution label right away instead of the generic
+        // [deepseek] summary text. The description used to be overwritten with the label only after
+        // [deepseek] the user picked an entry, so the setting looked unset on first open.
+        val resolutionLabels = resources.getStringArray(R.array.pref_list_resolution)
+        val resolutionValues = resources.getStringArray(R.array.pref_list_resolution_values)
+
+        // [deepseek] Fall back to the default resolution "1280" when nothing has been stored yet.
+        val selectedResolution = prefs.getString(R.string.pref_key_resolution, "1280")
+
+        // [deepseek] Map the stored value to its label; guard against unknown values so an invalid
+        // [deepseek] preference cannot crash the settings screen with an IndexOutOfBoundsException.
+        val resolutionIndex = resolutionValues.indexOf(selectedResolution)
+        val resolutionDescription =
+                if (resolutionIndex >= 0) {
+                    resolutionLabels[resolutionIndex]
+                } else {
+                    getString(R.string.pref_summary_resolution)
+                }
+
+        val resolution = radioListAction(
+                ACTION_RESOLUTION,
+                getString(R.string.pref_title_resolution),
+                resolutionDescription,
+                ACTION_RESOLUTION_SET_ID,
+                resolutionLabels,
+                resolutionValues,
+                selectedResolution
+        )
+        // [deepseek] End of resolution summary fix.
 
         val enterHorizontalLEDCount = unSignedNumberAction(
                 ACTION_X_LED_COUNT,
@@ -156,6 +187,7 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
 
         actions.add(enterHost)
         actions.add(enterPort)
+        actions.add(resolution)
         actions.add(enterHorizontalLEDCount)
         actions.add(enterVerticalLEDCount)
         actions.add(startOnBoot)
@@ -186,6 +218,7 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
             try {
                 val host = assertStringValue(ACTION_HOST_NAME)
                 val port = assertIntValue(ACTION_PORT)
+                val resolution = assertSubActionValue(ACTION_RESOLUTION, String::class.java)
                 val xLED = assertIntValue(ACTION_X_LED_COUNT)
                 val yLED = assertIntValue(ACTION_Y_LED_COUNT)
                 val startOnBootEnabled = findActionById(ACTION_START_ON_BOOT).isChecked
@@ -198,6 +231,7 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
 
                 prefs.putString(R.string.pref_key_host, host)
                 prefs.putInt(R.string.pref_key_port, port)
+                prefs.putString(R.string.pref_key_resolution, resolution)
                 prefs.putInt(R.string.pref_key_x_led, xLED)
                 prefs.putInt(R.string.pref_key_y_led, yLED)
                 prefs.putBoolean(R.string.pref_key_boot, startOnBootEnabled)
@@ -271,6 +305,8 @@ internal class BasicSettingsStepFragment : SettingsStepBaseFragment() {
         private const val ACTION_HOST_NAME = 100L
         private const val ACTION_PORT = 110L
         private const val ACTION_START_ON_BOOT = 120L
+        private const val ACTION_RESOLUTION = 121L
+        private const val ACTION_RESOLUTION_SET_ID = 122
         private const val ACTION_X_LED_COUNT = 130L
         private const val ACTION_Y_LED_COUNT = 140L        
         private const val ACTION_RECONNECT_GROUP = 200L

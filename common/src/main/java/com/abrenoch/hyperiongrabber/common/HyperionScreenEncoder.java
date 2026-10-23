@@ -19,17 +19,37 @@ import com.abrenoch.hyperiongrabber.common.network.HyperionThread;
 import com.abrenoch.hyperiongrabber.common.util.BorderProcessor;
 import com.abrenoch.hyperiongrabber.common.util.HyperionGrabberOptions;
 
-import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
+import java.util.Locale;
 
 public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
-    //ImageReader-Buffergröße auf 2 oder 3 begrenzen
-    //Ein zu großer Buffer erhöht Latenz und RAM-Verbrauch:
-    private static final int MAX_IMAGE_READER_IMAGES = 7;
+    // Use 2 buffers: At least 2 are required so the Surface producer (VirtualDisplay)
+    // always has a free buffer to render into while the consumer processes/releases the previous frame.
+    // Setting this to 1 causes pipeline stalls and dropped frames.
+    private static final int MAX_IMAGE_READER_IMAGES = 2;
     private static final String TAG = "HyperionScreenEncoder";
     private static final boolean DEBUG = false;
     private VirtualDisplay mVirtualDisplay;
     private ImageReader mImageReader;
+
+    int mScaledWidth;
+    int mScaledHeight;
+    // [deepseek] Ping-pong frame buffers: the capture thread writes into one buffer while the
+    // [deepseek] network thread still owns the other one, so no per-frame clone() is needed on
+    // [deepseek] the hot path. mUseAltBuffer selects which buffer the next frame goes into.
+    private byte[] mRgbBuffer;
+    private byte[] mRgbBufferAlt;
+    private boolean mUseAltBuffer;
+    // [deepseek] Scratch row buffer for bulk reads of one full source row. Reading a whole row
+    // [deepseek] with a single ByteBuffer.get() avoids three bounds-checked get() calls per pixel.
+    private byte[] mRowBuffer;
+        // [deepseek] Reused 3-byte buffer for the average-color path so that no byte[] is allocated
+    // [deepseek] on every frame (the old code created a ByteArrayOutputStream per call).
+    private final byte[] mAvgColorBuffer = new byte[3];
+    // [deepseek] Removed the private mDownscaleFactor field that used to live here: it shadowed the
+    // [deepseek] field of the same name in HyperionScreenEncoderBase. Before prepare() copied the
+    // [deepseek] base value into it, reads returned 0, which would have caused a division by zero
+    // [deepseek] in setImageReader(). The inherited field is used now, and it can no longer go stale.
 
     @TargetApi(Build.VERSION_CODES.LOLLIPOP)
     HyperionScreenEncoder(final HyperionThread.HyperionThreadListener listener,
@@ -49,35 +69,71 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
     private void prepare() throws MediaCodec.CodecException {
         if (DEBUG) Log.d(TAG, "Preparing encoder");
 
+        //Note that DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION is always enabled.
         int flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION;// | DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR;
         flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
         // flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
         //   | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
-        flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR;
+                flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR;
+
+                // [deepseek] getGrabberWidth()/getGrabberHeight() return the capture resolution selected by
+        // [deepseek] the resolution preference (160x90 ... 1920x1080). Whether it is reduced before
+        // [deepseek] being sent is decided by PASSTHROUGH_1_TO_1 in HyperionScreenEncoderBase.
         setImageReader();
 
         mVirtualDisplay = mMediaProjection.createVirtualDisplay(
                 TAG,
-                getGrabberWidth(), getGrabberHeight(), mDensity,
+                getGrabberWidth(), 
+                getGrabberHeight(), 
+                mDensity,
                 flags,
-                null, mDisplayCallback, null);
+                null, 
+                mDisplayCallback, 
+                null);
 
         mVirtualDisplay.setSurface(mImageReader.getSurface());
+
+                // [deepseek] There is deliberately no frame rate control for the virtual display here.
+        // [deepseek] Tried and measured: Surface.setFrameRate() on the capture Surface is accepted
+        // [deepseek] without error on API 30, but it has no effect. With the framerate preference at
+        // [deepseek] 30 fps the virtual display still produced 40-50 frames per second while the
+        // [deepseek] screen was moving. createVirtualDisplay() itself takes no frame rate argument,
+        // [deepseek] so the capture rate can only be bounded on the consumer side, in
+        // [deepseek] imageAvailableListener below.
 
         //setImageReader();
     }
 
-    @Override
+        @Override
     public void stopRecording() {
         if (DEBUG) Log.i(TAG, "stopRecording Called");
         setCapturing(false);
-        mVirtualDisplay.release();
-        mHandler.getLooper().quit();
-        clearAndDisconnect();
+
+        // [deepseek] Detach the ImageReader's BufferQueue from the virtual display before releasing
+        // [deepseek] it. Calling release() alone left the display device registered with state=ON and
+        // [deepseek] still mirroring on this TV (Android 11, MStar HAL): three start/stop cycles in one
+        // [deepseek] process left three live 240x135 mirror displays behind, and only force-stop
+        // [deepseek] removed them. Every leftover mirror is extra composition work for the display HAL,
+        // [deepseek] which is where most of the grabber's CPU cost is spent.
+        if (mVirtualDisplay != null) {
+            mVirtualDisplay.setSurface(null);
+            mVirtualDisplay.release();
+            mVirtualDisplay = null;
+        }
+
+        // [deepseek] Drop the callback before closing so a queued frame cannot run against a closed
+        // [deepseek] reader.
         if (mImageReader != null) {
+            mImageReader.setOnImageAvailableListener(null, null);
             mImageReader.close();
             mImageReader = null;
         }
+
+        if (mHandler != null) {
+            mHandler.getLooper().quit();
+        }
+
+        clearAndDisconnect();
     }
 
     @Override
@@ -143,34 +199,113 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         int height = getGrabberHeight();
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !mUseLegacyImageReader) {
-            Log.i(TAG, "Using new image reader...");
+            if (DEBUG) Log.d(TAG, "Using new image reader...");
 
             mImageReader = ImageReader.newInstance(width, height,
                     HardwareBuffer.RGBA_8888, MAX_IMAGE_READER_IMAGES, HardwareBuffer.USAGE_CPU_READ_OFTEN);
             
         } else {
-            Log.i(TAG, "Using legacy image reader...");
+            if (DEBUG) Log.d(TAG, "Using legacy image reader...");
 
             mImageReader = ImageReader.newInstance(width, height,
                     PixelFormat.RGBA_8888, MAX_IMAGE_READER_IMAGES);
         }
 
-        scaledWidth = width / DOWNSCALE_FACTOR;
-        scaledHeight = height / DOWNSCALE_FACTOR;
+                mScaledWidth = width / mDownscaleFactor;
+        mScaledHeight = height / mDownscaleFactor;
 
-        rgbBuffer = new byte[scaledWidth * scaledHeight * 3];
+                // [deepseek] The reader runs at capture size and getPixels() applies mDownscaleFactor exactly
+        // [deepseek] once. With PASSTHROUGH_1_TO_1 the factor is 1, so mScaledWidth/mScaledHeight equal
+        // [deepseek] the capture size and the buffers below hold a full uncompressed RGB frame.
+        // [deepseek] Allocate both ping-pong frame buffers up front so the capture loop never
+        // [deepseek] allocates memory per frame (avoids GC pressure on weak TV hardware).
+        mRgbBuffer = new byte[mScaledWidth * mScaledHeight * 3];
+        mRgbBufferAlt = new byte[mScaledWidth * mScaledHeight * 3];
+        mUseAltBuffer = false;
+        // [deepseek] One full RGBA row of the source image, reused for every row of every frame.
+        mRowBuffer = new byte[width * 4];
 
-        Log.d(TAG, "rgbBuffer " + String.valueOf(scaledWidth * scaledHeight * 3));
+        if (DEBUG) Log.d(TAG, "mRgbBuffer " + String.valueOf(mScaledWidth * mScaledHeight * 3));
 
         mImageReader.setOnImageAvailableListener(imageAvailableListener, mHandler);
         //mVirtualDisplay.setSurface(mImageReader.getSurface());
         setCapturing(true);
     }
 
-    private OnImageAvailableListener imageAvailableListener = new OnImageAvailableListener() {
-        double min_nano_time = 1e9 / mFrameRate;
-        long lastFrame;
+                    // [deepseek] TEMPORARY INSTRUMENTATION for measuring the capture and send rate.
+    // [deepseek] Counts how many *distinct* frames the virtual display produces and how many frames
+    // [deepseek] we actually send, then logs both rates every 5 seconds.
+    // [deepseek] "Distinct" means keyed on the Image timestamp: acquireLatestImage() hands out the
+    // [deepseek] same producer frame again after close(), which would roughly double a plain count.
+    // [deepseek] Measured reference values on this TV:
+    // [deepseek]   producer rate is content driven, not a constant 60 Hz - a static screen produces
+    // [deepseek]   only ~8 img/s, moving content ~40-50 img/s.
+    // [deepseek]   "fps sent" must sit at or just below the configured framerate. Clearly below it
+    // [deepseek]   means the pacing did not keep up: with the old relative throttle, 30 configured
+    // [deepseek]   produced only ~21.6 fps sent.
+    // [deepseek] Master switch for the instrumentation below. When false, countImage() returns
+    // [deepseek] immediately and the JIT removes the rest, so the code can stay in place without
+    // [deepseek] costing anything. The per frame overhead when enabled is a field read, a long
+    // [deepseek] compare and one System.nanoTime() (~100 ns), plus one Log.i every 5 seconds.
+    private static final boolean STATS = true;
+    private static final long STATS_INTERVAL_NS = 5_000_000_000L;
+    private long mUniqueImages;
+    private long mFramesSent;
+    private long mLastImageTimestamp = Long.MIN_VALUE;
+    private long mStatsStartTime = System.nanoTime();
+    private boolean mSettingsLogged;
 
+    private void logSettingsOnce() {
+        if (mSettingsLogged) return;
+        mSettingsLogged = true;
+        Log.i(TAG, "Config: framerate=" + mFrameRate
+                + " capture=" + mCaptureWidth + "x" + mCaptureHeight
+                + " sent=" + mScaledWidth + "x" + mScaledHeight
+                + " downscale=" + mDownscaleFactor);
+    }
+
+    private void countImage(Image img) {
+        if (!STATS) return;
+        logSettingsOnce();
+
+        // [deepseek] Only count frames with a new producer timestamp, see explanation above.
+        final long timestamp = img.getTimestamp();
+        if (timestamp != mLastImageTimestamp) {
+            mLastImageTimestamp = timestamp;
+            mUniqueImages++;
+        }
+
+        final long elapsed = System.nanoTime() - mStatsStartTime;
+        if (elapsed < STATS_INTERVAL_NS) return;
+
+        final double seconds = elapsed / 1e9;
+        Log.i(TAG, String.format(Locale.US,
+                "Stats: %d images, %d sent in %.1f s -> %.1f img/s producer, %.1f fps sent, ratio %.2f:1",
+                mUniqueImages, mFramesSent, seconds,
+                mUniqueImages / seconds, mFramesSent / seconds,
+                mFramesSent == 0 ? 0.0 : (double) mUniqueImages / mFramesSent));
+        mUniqueImages = 0;
+        mFramesSent = 0;
+        mStatsStartTime = System.nanoTime();
+    }
+
+        // [deepseek] Frame pacing. The old throttle compared against the timestamp of the last frame
+    // [deepseek] that was actually sent ("now - lastFrame >= min_nano_time" together with
+    // [deepseek] "lastFrame = now"). Because that check runs on the ImageReader callback, i.e. on the
+    // [deepseek] vsync grid, every send is rounded up to the next callback - and resetting the
+    // [deepseek] reference to "now" means the rounding error is never recovered. The throttle could
+    // [deepseek] therefore only ever end up slower than the configured rate. Measured: 30 fps
+    // [deepseek] configured produced 21.6 fps actually sent, because two vsync intervals (33.333 ms)
+    // [deepseek] fall a few nanoseconds short of 1e9/30, so the throttle slipped to three intervals
+    // [deepseek] (50 ms -> 20 fps).
+    //
+    // [deepseek] An absolute deadline advanced by exactly one period keeps the long term rate at the
+    // [deepseek] configured value. Individual gaps still follow the vsync grid and vary, but the
+    // [deepseek] rounding error no longer accumulates.
+    private final long mFramePeriodNanos = 1_000_000_000L / Math.max(1, mFrameRate);
+    private long mNextFrameDeadline = System.nanoTime();
+
+    private OnImageAvailableListener imageAvailableListener = new OnImageAvailableListener() {
         @RequiresApi(api = Build.VERSION_CODES.KITKAT)
         @Override
         public void onImageAvailable(ImageReader reader) {
@@ -179,10 +314,18 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
                     long now = System.nanoTime();
                     Image img = reader.acquireLatestImage();
                     if (img != null) {
-                        // Nur Bild verarbeiten, wenn die Framerate seit dem letzten Frame überschritten ist
-                        if (now - lastFrame >= min_nano_time) {
+                        countImage(img);
+                        if (now >= mNextFrameDeadline) {
                             sendImage(img);
-                            lastFrame = now; // Zeitstempel des letzten verarbeiteten Frames
+                            mFramesSent++;
+                            mNextFrameDeadline += mFramePeriodNanos;
+
+                            // [deepseek] If we fell more than one whole period behind (screen off,
+                            // [deepseek] long pause, GC hiccup) resync instead of firing a burst of
+                            // [deepseek] frames back to back to "catch up".
+                            if (now - mNextFrameDeadline > mFramePeriodNanos) {
+                                mNextFrameDeadline = now + mFramePeriodNanos;
+                            }
                         }
                         img.close(); // Bild nach der Verwendung schließen                        
                     }
@@ -193,31 +336,49 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         }
     };
 
-    private byte[] getPixels(ByteBuffer buffer, int width, int height, int rowStride,
-                         int pixelStride, int downscaleFactor) {
-
-        int targetWidth = width  / downscaleFactor;
-        int targetHeight = height / downscaleFactor;
-
+    private byte[] getPixels(ByteBuffer buffer, int width, int height, int rowStride, int pixelStride, int downscaleFactor) 
+    {  
+        // [deepseek] Alternate between the two frame buffers so the buffer that was handed to the
+        // [deepseek] network thread is never overwritten while it is still being serialized/sent.
+        final byte[] out = mUseAltBuffer ? mRgbBufferAlt : mRgbBuffer;
+        mUseAltBuffer = !mUseAltBuffer;
         int outputIndex = 0;
 
-        for (int y = 0; y < height ; y += downscaleFactor) {
+        // [deepseek] Fast path: tightly packed RGBA rows (pixelStride == 4, no row padding).
+        // [deepseek] One bulk get() per row replaces three bounds-checked absolute get() calls
+        // [deepseek] per pixel, which is the dominant cost of the whole capture pipeline.
+        if (pixelStride == 4 && rowStride == width * 4) {
+            final byte[] row = mRowBuffer;
+            for (int y = 0; y < height; y += downscaleFactor) {
+                buffer.position(y * rowStride);
+                buffer.get(row, 0, rowStride);
+
+                for (int x = 0, src = 0; x < width; x += downscaleFactor, src += 4 * downscaleFactor) {
+                    out[outputIndex++] = row[src];
+                    out[outputIndex++] = row[src + 1];
+                    out[outputIndex++] = row[src + 2];
+                }
+            }
+            return out;
+        }
+
+        // [deepseek] Fallback: padded rows or an unusual pixel stride, handled with the original
+        // [deepseek] per-pixel absolute reads.
+        for (int y = 0; y < height; y += downscaleFactor) 
+        {
             int rowStart = y * rowStride;
-
-            for (int x = 0; x < width ; x += downscaleFactor) {
-                int pixelIndex = rowStart + x * pixelStride;
-
-                byte r = buffer.get(pixelIndex);       // R
-                byte g = buffer.get(pixelIndex + 1);   // G
-                byte b = buffer.get(pixelIndex + 2);   // B
-
-                rgbBuffer[outputIndex++] = r;
-                rgbBuffer[outputIndex++] = g;
-                rgbBuffer[outputIndex++] = b;
+            
+            for (int x = 0; x < width; x += downscaleFactor) 
+            {                
+                int pixelIndex = rowStart + x * pixelStride;   
+                
+                out[outputIndex++] = buffer.get(pixelIndex);
+                out[outputIndex++] = buffer.get(pixelIndex + 1);
+                out[outputIndex++] = buffer.get(pixelIndex + 2);
             }
         }
 
-        return rgbBuffer;
+        return out;
     }
 
     private byte[] getAverageColor(ByteBuffer buffer, int width, int height, int rowStride,
@@ -226,8 +387,6 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         int rowPadding = rowStride - width * pixelStride;
         int pixelCount = 0;
         int offset = 0;
-
-        ByteArrayOutputStream bao = new ByteArrayOutputStream(3);
 
         for (int y = 0, compareHeight = height - firstY - 1; y < height; y++, offset += rowPadding) {
             if (y < firstY || y > compareHeight) {
@@ -243,17 +402,17 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
             }
         }
 
-        bao.write((int) totalRed / pixelCount);
-        bao.write((int) totalGreen / pixelCount);
-        bao.write((int) totalBlue / pixelCount);
+        // [deepseek] Guard against a fully cropped image: without this the division below would
+        // [deepseek] throw ArithmeticException (division by zero).
+        if (pixelCount == 0) return mAvgColorBuffer;
 
-        return bao.toByteArray();
+        // [deepseek] Write into the reused buffer instead of allocating a new byte[] per frame.
+        mAvgColorBuffer[0] = (byte) ((int) totalRed / pixelCount);
+        mAvgColorBuffer[1] = (byte) ((int) totalGreen / pixelCount);
+        mAvgColorBuffer[2] = (byte) ((int) totalBlue / pixelCount);
+
+        return mAvgColorBuffer;
     }
-
-    int scaledWidth;
-    int scaledHeight;
-    private byte[] rgbBuffer;
-    private static final int DOWNSCALE_FACTOR = 10;
 
     private void sendImage(Image img) 
     {
@@ -286,9 +445,9 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         {                     
 
             mListener.sendFrame(
-                getPixels(buffer, width, height, rowStride, pixelStride, DOWNSCALE_FACTOR),
-                scaledWidth,
-                scaledHeight
+                getPixels(buffer, width, height, rowStride, pixelStride, mDownscaleFactor),
+                mScaledWidth,
+                mScaledHeight
             );  
         }
     }

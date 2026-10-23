@@ -4,25 +4,29 @@
     <string name="pref_key_port" translatable="false">pref_key_port</string>
     <integer name="pref_default_port" translatable="false">19445</integer>
 
+    <string name="pref_key_resolution" translatable="false">pref_key_resolution</string>
+    <integer name="pref_default_resolution" translatable="false">1280</integer>
+    <string-array name="pref_list_resolution_values" translatable="false">
+        <!-- [deepseek] Only the width is stored here; the height is derived from the real panel -->
+        <!-- [deepseek] aspect ratio in HyperionScreenEncoderBase. 80 -> 80x45 on a 16:9 panel. -->
+        <item>80</item>
+        <item>160</item>
+        <item>240</item>
+        <item>320</item>
+        <item>640</item>
+        <item>1280</item>
+        <item>1920</item>
+    </string-array>
+
     <string name="pref_key_y_led" translatable="false">pref_key_y_led</string>
-    <!-- Best performance -->
-    <!-- <integer name="pref_default_y_led" translatable="false">9</integer> -->
-    <!-- <integer name="pref_default_y_led" translatable="false">36</integer> -->
-    <!-- <integer name="pref_default_y_led" translatable="false">36</integer> -->
-    <integer name="pref_default_y_led" translatable="false">180</integer>
-    <!-- <integer name="pref_default_y_led" translatable="false">240</integer> -->
-    <!-- <integer name="pref_default_y_led" translatable="false">1080</integer> -->
-    <!-- <integer name="pref_default_y_led" translatable="false">540</integer> -->
+    <!-- [deepseek] Default LED matrix is now 128x72 (9216 LEDs) instead of 1280x720. -->
+    <!-- [deepseek] 128x72 is an exact integer division of the 640, 1280 and 1920 capture sizes -->
+    <!-- [deepseek] (divisor 5 / 10 / 15), so the image sent to Hyperion matches the LED matrix 1:1. -->
+    <!-- [deepseek] Only the 320 capture size cannot hit it exactly and falls back to 160x90. -->
+    <integer name="pref_default_y_led" translatable="false">72</integer>
 
     <string name="pref_key_x_led" translatable="false">pref_key_x_led</string>
-    <!-- Best performance -->
-    <!-- <integer name="pref_default_x_led" translatable="false">16</integer> -->
-    <!-- <integer name="pref_default_x_led" translatable="false">64</integer> -->
-    <!-- <integer name="pref_default_x_led" translatable="false">46</integer> -->
-    <integer name="pref_default_x_led" translatable="false">320</integer>
-    <!-- <integer name="pref_default_x_led" translatable="false">426</integer> -->
-    <!-- <integer name="pref_default_x_led" translatable="false">1920</integer> -->
-    <!-- <integer name="pref_default_x_led" translatable="false">960</integer> -->
+    <integer name="pref_default_x_led" translatable="false">128</integer>
 
     <string name="pref_key_priority" translatable="false">pref_key_priority</string>
     <integer name="pref_default_priority" translatable="false">150</integer>
@@ -37,7 +41,7 @@
     <bool name="pref_default_boot" translatable="false">true</bool>
 
     <string name="pref_key_framerate" translatable="false">pref_key_framerate</string>
-    <integer name="pref_default_framerate" translatable="false">30</integer>
+    <integer name="pref_default_framerate" translatable="false">15</integer>
     <string-array name="pref_list_framerate_values" translatable="false">
         <item>10</item>
         <item>15</item>
