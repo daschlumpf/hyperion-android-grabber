@@ -96,18 +96,7 @@ public class HyperionThread extends Thread {
 
         @Override
         public void disconnect() {
-            mRunning = false;
-            mConnected = false;
-            synchronized (mQueueLock) {
-                mQueueLock.notifyAll();
-            }
             interrupt();
-            Hyperion h = mHyperion;
-            if (h != null) {
-                try {
-                    h.disconnect();
-                } catch (IOException ignored) {}
-            }
         }
 
         @Override

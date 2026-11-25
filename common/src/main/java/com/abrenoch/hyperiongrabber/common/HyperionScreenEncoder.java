@@ -16,7 +16,6 @@ import androidx.annotation.RequiresApi;
 import android.util.Log;
 
 import com.abrenoch.hyperiongrabber.common.network.HyperionThread;
-import com.abrenoch.hyperiongrabber.common.util.BorderProcessor;
 import com.abrenoch.hyperiongrabber.common.util.HyperionGrabberOptions;
 
 import java.nio.ByteBuffer;
@@ -36,6 +35,7 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
     private static final long STALL_TIMEOUT_NS = 20_000_000_000L;
     private static final int MAX_CONSECUTIVE_RECOVERIES = 3;
 
+    private final Object mSurfaceLock = new Object();
     private VirtualDisplay mVirtualDisplay;
     private ImageReader mImageReader;
     private volatile long mLastImageTimeNs = System.nanoTime();
@@ -119,18 +119,20 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         // [deepseek] process left three live 240x135 mirror displays behind, and only force-stop
         // [deepseek] removed them. Every leftover mirror is extra composition work for the display HAL,
         // [deepseek] which is where most of the grabber's CPU cost is spent.
-        if (mVirtualDisplay != null) {
-            mVirtualDisplay.setSurface(null);
-            mVirtualDisplay.release();
-            mVirtualDisplay = null;
-        }
+        synchronized (mSurfaceLock) {
+            if (mVirtualDisplay != null) {
+                mVirtualDisplay.setSurface(null);
+                mVirtualDisplay.release();
+                mVirtualDisplay = null;
+            }
 
-        // [deepseek] Drop the callback before closing so a queued frame cannot run against a closed
-        // [deepseek] reader.
-        if (mImageReader != null) {
-            mImageReader.setOnImageAvailableListener(null, null);
-            mImageReader.close();
-            mImageReader = null;
+            // [deepseek] Drop the callback before closing so a queued frame cannot run against a closed
+            // [deepseek] reader.
+            if (mImageReader != null) {
+                mImageReader.setOnImageAvailableListener(null, null);
+                mImageReader.close();
+                mImageReader = null;
+            }
         }
 
         if (mHandler != null) {
@@ -157,11 +159,11 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
     public void onScreenOn() {
         if (mStopped || mHandler == null) return;
         mScreenOn = true;
-        mConsecutiveRecoveries = 0;
         mHandler.post(new Runnable() {
             @Override
             public void run() {
                 if (mStopped) return;
+                mConsecutiveRecoveries = 0;
                 drainLatestImageLocked();
                 mNextFrameDeadline = System.nanoTime();
                 setCapturing(true);
@@ -229,21 +231,23 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
      */
     @RequiresApi(api = Build.VERSION_CODES.KITKAT_WATCH)
     private void recoverImageReader(String reason) {
-        if (mStopped || mVirtualDisplay == null) return;
-        Log.w(TAG, "Recovering ImageReader (" + reason + ")");
-        try {
-            mVirtualDisplay.setSurface(null);
-            if (mImageReader != null) {
-                mImageReader.setOnImageAvailableListener(null, null);
-                mImageReader.close();
-                mImageReader = null;
+        synchronized (mSurfaceLock) {
+            if (mStopped || mVirtualDisplay == null) return;
+            Log.w(TAG, "Recovering ImageReader (" + reason + ")");
+            try {
+                mVirtualDisplay.setSurface(null);
+                if (mImageReader != null) {
+                    mImageReader.setOnImageAvailableListener(null, null);
+                    mImageReader.close();
+                    mImageReader = null;
+                }
+                createImageReaderInstance();
+                mVirtualDisplay.setSurface(mImageReader.getSurface());
+                mNextFrameDeadline = System.nanoTime();
+                setCapturing(true);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to recover ImageReader", e);
             }
-            createImageReaderInstance();
-            mVirtualDisplay.setSurface(mImageReader.getSurface());
-            mNextFrameDeadline = System.nanoTime();
-            setCapturing(true);
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to recover ImageReader", e);
         }
     }
 
@@ -635,6 +639,10 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
                         + " ms (max channel " + sampleMax + "), sending orange");
             }
         } else {
+            if (!mSendingOrange && mBlackFrameCount >= 5) {
+                long durMs = (System.nanoTime() - mBlackSinceNs) / 1_000_000L;
+                Log.i(TAG, "Suppressed short black burst: " + mBlackFrameCount + " frames (" + durMs + " ms)");
+            }
             mBlackFrameCount = 0;
             mBlackSinceNs = 0L;
             if (mSendingOrange) {
@@ -732,6 +740,10 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
 
         if (isSendingOrange()) {
             mListener.sendFrame(getOrangeBuffer(), mScaledWidth, mScaledHeight, false);
+        } else if (mDrmOrangeFallback && mBlackFrameCount > 0) {
+            // Hold the last valid LED colors during short pure-black bursts (< 2.5s, e.g. MStar
+            // detiler hiccups or scene cuts) instead of turning all LEDs off.
+            return;
         } else {
             mCaptureBuffer = mListener.sendFrame(out, mScaledWidth, mScaledHeight, true);
         }

@@ -7,13 +7,11 @@ import android.os.HandlerThread;
 import android.util.Log;
 
 import com.abrenoch.hyperiongrabber.common.network.HyperionThread;
-import com.abrenoch.hyperiongrabber.common.util.BorderProcessor;
 import com.abrenoch.hyperiongrabber.common.util.HyperionGrabberOptions;
 
 public class HyperionScreenEncoderBase {
     static final boolean DEBUG = false;
     private static final String TAG = "ScreenEncoderBase";
-    private final int CLEAR_COMMAND_DELAY_MS = 100;
     private final int INIT_ORIENTATION;
 
         final boolean mRemoveBorders = false; // enables detecting borders for standard grabbing - disabled for now
