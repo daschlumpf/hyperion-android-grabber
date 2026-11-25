@@ -118,9 +118,8 @@ public class HyperionScreenService extends Service {
             switch (Objects.requireNonNull(intent.getAction())) {
                 case Intent.ACTION_SCREEN_ON:
                     if (DEBUG) Log.v(TAG, "ACTION_SCREEN_ON intent received");
-                    if (mHyperionEncoder != null && !isCapturing()) {
-                        if (DEBUG) Log.v(TAG, "Encoder not grabbing, attempting to restart");
-                        mHyperionEncoder.resumeRecording();
+                    if (mHyperionEncoder != null) {
+                        mHyperionEncoder.onScreenOn();
                     }
                     notifyActivity();
                 break;
@@ -128,6 +127,7 @@ public class HyperionScreenService extends Service {
                     if (DEBUG) Log.v(TAG, "ACTION_SCREEN_OFF intent received");
                     if (mHyperionEncoder != null) {
                         if (DEBUG) Log.v(TAG, "Clearing current light data");
+                        mHyperionEncoder.onScreenOff();
                         mHyperionEncoder.clearLights();
                     }
                 break;

@@ -40,6 +40,7 @@ public class MainActivity extends LeanbackActivity implements ImageView.OnClickL
     public static final String BROADCAST_FILTER = "SERVICE_FILTER";
     private static final String TAG = "DEBUG";
     private boolean mRecorderRunning = false;
+    private boolean mReceiverRegistered = false;
     private static MediaProjectionManager mMediaProjectionManager;
     
     private BroadcastReceiver mMessageReceiver = new BroadcastReceiver() {
@@ -118,11 +119,23 @@ public class MainActivity extends LeanbackActivity implements ImageView.OnClickL
 
         setImageViews(mRecorderRunning, false);
 
-        LocalBroadcastManager.getInstance(this).registerReceiver(
-                mMessageReceiver, new IntentFilter(BROADCAST_FILTER));
+        if (!mReceiverRegistered) {
+            LocalBroadcastManager.getInstance(this).registerReceiver(
+                    mMessageReceiver, new IntentFilter(BROADCAST_FILTER));
+            mReceiverRegistered = true;
+        }
 
         // request an update on the running status
         checkForInstance();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (mReceiverRegistered) {
+            LocalBroadcastManager.getInstance(this).unregisterReceiver(mMessageReceiver);
+            mReceiverRegistered = false;
+        }
+        super.onDestroy();
     }
 
     @Override

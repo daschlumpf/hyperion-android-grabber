@@ -29,27 +29,30 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
     private static final int MAX_IMAGE_READER_IMAGES = 2;
     private static final String TAG = "HyperionScreenEncoder";
     private static final boolean DEBUG = false;
+
+    // Auto-recovery timings for Android TV / MStar HAL standby or BufferQueue stalls
+    private static final long SCREEN_ON_CHECK_DELAY_MS = 2500L;
+    private static final long WATCHDOG_INTERVAL_MS = 15_000L;
+    private static final long STALL_TIMEOUT_NS = 20_000_000_000L;
+    private static final int MAX_CONSECUTIVE_RECOVERIES = 3;
+
     private VirtualDisplay mVirtualDisplay;
     private ImageReader mImageReader;
+    private volatile long mLastImageTimeNs = System.nanoTime();
+    private volatile boolean mScreenOn = true;
+    private volatile boolean mStopped = false;
+    private int mConsecutiveRecoveries = 0;
 
     int mScaledWidth;
     int mScaledHeight;
-    // [deepseek] Ping-pong frame buffers: the capture thread writes into one buffer while the
-    // [deepseek] network thread still owns the other one, so no per-frame clone() is needed on
-    // [deepseek] the hot path. mUseAltBuffer selects which buffer the next frame goes into.
-    private byte[] mRgbBuffer;
-    private byte[] mRgbBufferAlt;
-    private boolean mUseAltBuffer;
-    // [deepseek] Scratch row buffer for bulk reads of one full source row. Reading a whole row
-    // [deepseek] with a single ByteBuffer.get() avoids three bounds-checked get() calls per pixel.
+    // Triple-buffered frame pool: capture thread owns mCaptureBuffer while the network thread
+    // and its pending slot own the other two buffers, eliminating both per-frame allocations
+    // and overwrite races when the network stalls.
+    private byte[] mCaptureBuffer;
+    // Scratch row buffer for bulk reads of one full source row (works even with GPU row padding).
     private byte[] mRowBuffer;
-        // [deepseek] Reused 3-byte buffer for the average-color path so that no byte[] is allocated
-    // [deepseek] on every frame (the old code created a ByteArrayOutputStream per call).
+    // Reused 3-byte buffer for the average-color path.
     private final byte[] mAvgColorBuffer = new byte[3];
-    // [deepseek] Removed the private mDownscaleFactor field that used to live here: it shadowed the
-    // [deepseek] field of the same name in HyperionScreenEncoderBase. Before prepare() copied the
-    // [deepseek] base value into it, reads returned 0, which would have caused a division by zero
-    // [deepseek] in setImageReader(). The inherited field is used now, and it can no longer go stale.
 
     @TargetApi(Build.VERSION_CODES.LOLLIPOP)
     HyperionScreenEncoder(final HyperionThread.HyperionThreadListener listener,
@@ -70,44 +73,45 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         if (DEBUG) Log.d(TAG, "Preparing encoder");
 
         //Note that DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION is always enabled.
-        int flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION;// | DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR;
-        flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
+        // int flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION;// | DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR;
+        // flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
         // flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
         //   | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
-                flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR;
+        // flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR;
 
-                // [deepseek] getGrabberWidth()/getGrabberHeight() return the capture resolution selected by
+        // Use AUTO_MIRROR to capture system content.
+        final int flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR;
+
+        // [deepseek] getGrabberWidth()/getGrabberHeight() return the capture resolution selected by
         // [deepseek] the resolution preference (160x90 ... 1920x1080). Whether it is reduced before
         // [deepseek] being sent is decided by PASSTHROUGH_1_TO_1 in HyperionScreenEncoderBase.
         setImageReader();
 
+        // Pass the ImageReader Surface directly during creation and dispatch callbacks on mHandler
+        // to avoid pipeline stalls or secondary display init cycles on TV display HALs.
         mVirtualDisplay = mMediaProjection.createVirtualDisplay(
                 TAG,
                 getGrabberWidth(), 
                 getGrabberHeight(), 
                 mDensity,
                 flags,
-                null, 
-                mDisplayCallback, 
-                null);
+                mImageReader.getSurface(), 
+                mDisplayCallback,
+                mHandler);
 
-        mVirtualDisplay.setSurface(mImageReader.getSurface());
-
-                // [deepseek] There is deliberately no frame rate control for the virtual display here.
-        // [deepseek] Tried and measured: Surface.setFrameRate() on the capture Surface is accepted
-        // [deepseek] without error on API 30, but it has no effect. With the framerate preference at
-        // [deepseek] 30 fps the virtual display still produced 40-50 frames per second while the
-        // [deepseek] screen was moving. createVirtualDisplay() itself takes no frame rate argument,
-        // [deepseek] so the capture rate can only be bounded on the consumer side, in
-        // [deepseek] imageAvailableListener below.
-
-        //setImageReader();
+        mLastImageTimeNs = System.nanoTime();
+        scheduleWatchdog();
     }
 
-        @Override
+    @Override
     public void stopRecording() {
         if (DEBUG) Log.i(TAG, "stopRecording Called");
+        mStopped = true;
         setCapturing(false);
+
+        if (mHandler != null) {
+            mHandler.removeCallbacksAndMessages(null);
+        }
 
         // [deepseek] Detach the ImageReader's BufferQueue from the virtual display before releasing
         // [deepseek] it. Calling release() alone left the display device registered with state=ON and
@@ -136,16 +140,129 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         clearAndDisconnect();
     }
 
-    @Override
-    public void resumeRecording() {
-        if (DEBUG) Log.i(TAG, "resumeRecording Called");
-        if (!isCapturing() && mImageReader != null) {
-            if (DEBUG) Log.i(TAG, "Resuming reading images");
-            Image img = mImageReader.acquireNextImage();
-            setCapturing(true);
+    /** Called by HyperionScreenService on ACTION_SCREEN_OFF. */
+    public void onScreenOff() {
+        mScreenOn = false;
+        if (mHandler != null) {
+            mHandler.removeCallbacks(mWatchdogRunnable);
+            mHandler.removeCallbacks(mScreenOnVerifyRunnable);
+        }
+    }
+
+    /**
+     * Called by HyperionScreenService on ACTION_SCREEN_ON.
+     * Drains stale frames and verifies that the display HAL resumes delivering frames;
+     * if no frame arrives within SCREEN_ON_CHECK_DELAY_MS, rebinds a fresh ImageReader surface.
+     */
+    public void onScreenOn() {
+        if (mStopped || mHandler == null) return;
+        mScreenOn = true;
+        mConsecutiveRecoveries = 0;
+        mHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (mStopped) return;
+                drainLatestImageLocked();
+                mNextFrameDeadline = System.nanoTime();
+                setCapturing(true);
+                mScreenOnBaselineNs = mLastImageTimeNs;
+                mHandler.removeCallbacks(mScreenOnVerifyRunnable);
+                mHandler.postDelayed(mScreenOnVerifyRunnable, SCREEN_ON_CHECK_DELAY_MS);
+                scheduleWatchdog();
+            }
+        });
+    }
+
+    private long mScreenOnBaselineNs;
+
+    private final Runnable mScreenOnVerifyRunnable = new Runnable() {
+        @RequiresApi(api = Build.VERSION_CODES.KITKAT_WATCH)
+        @Override
+        public void run() {
+            if (mStopped || !mScreenOn) return;
+            if (mLastImageTimeNs == mScreenOnBaselineNs) {
+                recoverImageReader("no frames after screen-on");
+            }
+        }
+    };
+
+    private final Runnable mWatchdogRunnable = new Runnable() {
+        @RequiresApi(api = Build.VERSION_CODES.KITKAT_WATCH)
+        @Override
+        public void run() {
+            if (mStopped || !mScreenOn) return;
+            if (isCapturing()) {
+                long silentNs = System.nanoTime() - mLastImageTimeNs;
+                if (silentNs >= STALL_TIMEOUT_NS && mConsecutiveRecoveries < MAX_CONSECUTIVE_RECOVERIES) {
+                    mConsecutiveRecoveries++;
+                    recoverImageReader("stalled for " + (silentNs / 1_000_000_000L) + "s");
+                }
+            }
+            scheduleWatchdog();
+        }
+    };
+
+    private void scheduleWatchdog() {
+        if (!mStopped && mScreenOn && mHandler != null) {
+            mHandler.removeCallbacks(mWatchdogRunnable);
+            mHandler.postDelayed(mWatchdogRunnable, WATCHDOG_INTERVAL_MS);
+        }
+    }
+
+    private void drainLatestImageLocked() {
+        if (mImageReader == null) return;
+        Image img = null;
+        try {
+            img = mImageReader.acquireLatestImage();
+        } catch (Exception ignored) {
+        } finally {
             if (img != null) {
                 img.close();
             }
+        }
+    }
+
+    /**
+     * Rebinds a fresh ImageReader BufferQueue onto the existing VirtualDisplay without recreating
+     * the VirtualDisplay itself (which avoids leaking mirror displays on MStar Android 11 HALs).
+     * Must run on mHandler.
+     */
+    @RequiresApi(api = Build.VERSION_CODES.KITKAT_WATCH)
+    private void recoverImageReader(String reason) {
+        if (mStopped || mVirtualDisplay == null) return;
+        Log.w(TAG, "Recovering ImageReader (" + reason + ")");
+        try {
+            mVirtualDisplay.setSurface(null);
+            if (mImageReader != null) {
+                mImageReader.setOnImageAvailableListener(null, null);
+                mImageReader.close();
+                mImageReader = null;
+            }
+            createImageReaderInstance();
+            mVirtualDisplay.setSurface(mImageReader.getSurface());
+            mNextFrameDeadline = System.nanoTime();
+            setCapturing(true);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to recover ImageReader", e);
+        }
+    }
+
+    @Override
+    public void resumeRecording() {
+        if (DEBUG) Log.i(TAG, "resumeRecording Called");
+        if (!mStopped && !isCapturing() && mHandler != null) {
+            // Drain stale frames on the ImageReader's own handler thread to avoid cross-thread races
+            mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!mStopped && !isCapturing() && mImageReader != null) {
+                        if (DEBUG) Log.i(TAG, "Resuming reading images");
+                        drainLatestImageLocked();
+                        mNextFrameDeadline = System.nanoTime();
+                        setCapturing(true);
+                    }
+                }
+            });
         }
     }
 
@@ -187,6 +304,27 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
 
     @SuppressLint("WrongConstant") // incorrectly reports PixelFormat.RGBA_8888 as incompatible
     @RequiresApi(api = Build.VERSION_CODES.KITKAT_WATCH)
+    private void createImageReaderInstance() {
+        int width = getGrabberWidth();
+        int height = getGrabberHeight();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !mUseLegacyImageReader) {
+            if (DEBUG) Log.d(TAG, "Using new image reader...");
+
+            mImageReader = ImageReader.newInstance(width, height,
+                    HardwareBuffer.RGBA_8888, MAX_IMAGE_READER_IMAGES, HardwareBuffer.USAGE_CPU_READ_OFTEN);
+        } else {
+            if (DEBUG) Log.d(TAG, "Using legacy image reader...");
+
+            mImageReader = ImageReader.newInstance(width, height,
+                    PixelFormat.RGBA_8888, MAX_IMAGE_READER_IMAGES);
+        }
+
+        mImageReader.setOnImageAvailableListener(imageAvailableListener, mHandler);
+    }
+
+    @SuppressLint("WrongConstant") // incorrectly reports PixelFormat.RGBA_8888 as incompatible
+    @RequiresApi(api = Build.VERSION_CODES.KITKAT_WATCH)
     private void setImageReader() {
         if (DEBUG) Log.d(TAG, "Setting image reader  " + String.valueOf(isCapturing()));
 
@@ -198,43 +336,30 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         int width = getGrabberWidth();
         int height = getGrabberHeight();
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !mUseLegacyImageReader) {
-            if (DEBUG) Log.d(TAG, "Using new image reader...");
+        createImageReaderInstance();
 
-            mImageReader = ImageReader.newInstance(width, height,
-                    HardwareBuffer.RGBA_8888, MAX_IMAGE_READER_IMAGES, HardwareBuffer.USAGE_CPU_READ_OFTEN);
-            
-        } else {
-            if (DEBUG) Log.d(TAG, "Using legacy image reader...");
-
-            mImageReader = ImageReader.newInstance(width, height,
-                    PixelFormat.RGBA_8888, MAX_IMAGE_READER_IMAGES);
-        }
-
-                mScaledWidth = width / mDownscaleFactor;
+        mScaledWidth = width / mDownscaleFactor;
         mScaledHeight = height / mDownscaleFactor;
 
-                // [deepseek] The reader runs at capture size and getPixels() applies mDownscaleFactor exactly
-        // [deepseek] once. With PASSTHROUGH_1_TO_1 the factor is 1, so mScaledWidth/mScaledHeight equal
-        // [deepseek] the capture size and the buffers below hold a full uncompressed RGB frame.
-        // [deepseek] Allocate both ping-pong frame buffers up front so the capture loop never
-        // [deepseek] allocates memory per frame (avoids GC pressure on weak TV hardware).
-                mRgbBuffer = new byte[mScaledWidth * mScaledHeight * 3];
-        mRgbBufferAlt = new byte[mScaledWidth * mScaledHeight * 3];
-        mUseAltBuffer = false;
+        // Allocate triple-buffered RGB frames up front (0 per-frame allocations on the hot path)
+        final int frameBytes = mScaledWidth * mScaledHeight * 3;
+        mCaptureBuffer = new byte[frameBytes];
+        if (mListener != null) {
+            mListener.initBuffers(new byte[frameBytes], new byte[frameBytes]);
+        }
         // [drmsample] The orange buffer is sized to the scaled dimensions, so it must be rebuilt
         // [drmsample] whenever the capture size changes; also reset the detection state so a
         // [drmsample] restart begins with a clean slate.
         mOrangeBuffer = null;
         mBlackFrameCount = 0;
+        mBlackSinceNs = 0L;
         mBrightFrameCount = 0;
         mSendingOrange = false;
-        // [deepseek] One full RGBA row of the source image, reused for every row of every frame.
+        // One full RGBA row of the source image, reused for every row of every frame.
         mRowBuffer = new byte[width * 4];
 
-        if (DEBUG) Log.d(TAG, "mRgbBuffer " + String.valueOf(mScaledWidth * mScaledHeight * 3));
+        if (DEBUG) Log.d(TAG, "mCaptureBuffer " + frameBytes);
 
-        mImageReader.setOnImageAvailableListener(imageAvailableListener, mHandler);
         //mVirtualDisplay.setSurface(mImageReader.getSurface());
         setCapturing(true);
     }
@@ -254,7 +379,7 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
     // [deepseek] immediately and the JIT removes the rest, so the code can stay in place without
     // [deepseek] costing anything. The per frame overhead when enabled is a field read, a long
     // [deepseek] compare and one System.nanoTime() (~100 ns), plus one Log.i every 5 seconds.
-    private static final boolean STATS = true;
+    private static final boolean STATS = false;
     private static final long STATS_INTERVAL_NS = 5_000_000_000L;
     private long mUniqueImages;
     private long mFramesSent;
@@ -317,159 +442,175 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         @RequiresApi(api = Build.VERSION_CODES.KITKAT)
         @Override
         public void onImageAvailable(ImageReader reader) {
-            if (mListener != null && isCapturing()) {
-                try {
-                    long now = System.nanoTime();
-                    Image img = reader.acquireLatestImage();
-                    if (img != null) {
-                        countImage(img);
-                        if (now >= mNextFrameDeadline) {
+            Image img = null;
+            try {
+                img = reader.acquireLatestImage();
+                if (img == null) return;
+
+                long now = System.nanoTime();
+                mLastImageTimeNs = now;
+                mConsecutiveRecoveries = 0;
+
+                if (mListener != null && isCapturing()) {
+                    countImage(img);
+                    if (now >= mNextFrameDeadline) {
+                        // Skip expensive pixel conversion while disconnected/reconnecting
+                        if (mListener.isConnected()) {
                             sendImage(img);
                             mFramesSent++;
-                            mNextFrameDeadline += mFramePeriodNanos;
-
-                            // [deepseek] If we fell more than one whole period behind (screen off,
-                            // [deepseek] long pause, GC hiccup) resync instead of firing a burst of
-                            // [deepseek] frames back to back to "catch up".
-                            if (now - mNextFrameDeadline > mFramePeriodNanos) {
-                                mNextFrameDeadline = now + mFramePeriodNanos;
-                            }
                         }
-                        img.close(); // Bild nach der Verwendung schließen                        
+                        mNextFrameDeadline += mFramePeriodNanos;
+
+                        // If we fell more than one whole period behind (screen off,
+                        // long pause, GC hiccup) resync instead of firing a burst of
+                        // frames back to back to "catch up".
+                        if (now - mNextFrameDeadline > mFramePeriodNanos) {
+                            mNextFrameDeadline = now + mFramePeriodNanos;
+                        }
                     }
-                } catch (final Exception e) {
-                    if (DEBUG) Log.w(TAG, "sendImage exception:", e);
+                }
+            } catch (final Exception e) {
+                if (DEBUG) Log.w(TAG, "sendImage exception:", e);
+            } finally {
+                // Always close the acquired Image so MAX_IMAGE_READER_IMAGES can never leak and stall the pipeline
+                if (img != null) {
+                    img.close();
                 }
             }
         }
     };
 
-    private byte[] getPixels(ByteBuffer buffer, int width, int height, int rowStride, int pixelStride, int downscaleFactor) 
-    {
-        // [deepseek] Alternate between the two frame buffers so the buffer that was handed to the
-        // [deepseek] network thread is never overwritten while it is still being serialized/sent.
-        final byte[] out = mUseAltBuffer ? mRgbBufferAlt : mRgbBuffer;
-        mUseAltBuffer = !mUseAltBuffer;
+    private void getPixels(ByteBuffer buffer, byte[] out, int width, int height,
+                           int rowStride, int pixelStride, int downscaleFactor) {
         int outputIndex = 0;
+        final int rowBytes = width * 4;
+        // Bulk row read works whenever pixels are tightly packed RGBA (pixelStride == 4),
+        // even if the GPU pads rowStride to 64/128/256-byte alignment.
+        final boolean bulkRowRead = pixelStride == 4 && rowStride >= rowBytes;
 
-        // [drmsample] Brightness probe for DRM detection. We do NOT do a second pass over the
-        // [drmsample] image: instead we sample a fixed grid of positions while the existing copy
-        // [drmsample] loop is already touching every pixel, so the extra cost is a couple of
-        // [drmsample] comparisons per row/column - no measurable impact.
-        // [drmsample] A sampled pixel counts as "bright" when any of R,G,B is clearly above black.
-        // [drmsample] Real content almost always has some non-black pixel in the grid; a protected
-        // [drmsample] layer that the compositor replaces with black produces an all-black grid.
+        if (bulkRowRead && downscaleFactor == 1) {
+            final byte[] row = mRowBuffer;
+            for (int y = 0; y < height; y++) {
+                buffer.position(y * rowStride);
+                buffer.get(row, 0, rowBytes);
+                for (int src = 0; src < rowBytes; src += 4) {
+                    out[outputIndex++] = row[src];
+                    out[outputIndex++] = row[src + 1];
+                    out[outputIndex++] = row[src + 2];
+                }
+            }
+        } else if (bulkRowRead) {
+            final byte[] row = mRowBuffer;
+            final int srcStep = 4 * downscaleFactor;
+            for (int y = 0; y < height; y += downscaleFactor) {
+                buffer.position(y * rowStride);
+                buffer.get(row, 0, rowBytes);
+                for (int src = 0; src < rowBytes; src += srcStep) {
+                    out[outputIndex++] = row[src];
+                    out[outputIndex++] = row[src + 1];
+                    out[outputIndex++] = row[src + 2];
+                }
+            }
+        } else {
+            final int srcStep = pixelStride * downscaleFactor;
+            for (int y = 0; y < height; y += downscaleFactor) {
+                final int rowStart = y * rowStride;
+                for (int x = 0, src = 0; x < width; x += downscaleFactor, src += srcStep) {
+                    final int pixelIndex = rowStart + src;
+                    out[outputIndex++] = buffer.get(pixelIndex);
+                    out[outputIndex++] = buffer.get(pixelIndex + 1);
+                    out[outputIndex++] = buffer.get(pixelIndex + 2);
+                }
+            }
+        }
+    }
+
+    /**
+     * Fast DRM brightness probe directly on the source ByteBuffer (~60 pixels at 160x90).
+     * Used while DRM orange fallback is active so we avoid copying the entire frame.
+     */
+    private void probeDrmDirect(ByteBuffer buffer, int width, int height, int rowStride, int pixelStride) {
         int sampleMax = 0;
         int brightSamples = 0;
         int sampleCount = 0;
-        // [drmsample] Skip the probing entirely when the user disabled the fallback, so a disabled
-        // [drmsample] feature costs literally nothing in the copy loop.
-        final boolean doSampling = mDrmOrangeFallback;
 
-        // [deepseek] Path selection: the fast path handles tightly packed RGBA rows (pixelStride == 4,
-        // [deepseek] no row padding) with one bulk get() per row; the fallback handles padded rows or
-        // [deepseek] an unusual pixel stride with per-pixel absolute reads. Only the addressing of a
-        // [deepseek] single pixel differs, so both share the loop below.
-        final boolean bulkRowRead = pixelStride == 4 && rowStride == width * 4;
-        final byte[] row = bulkRowRead ? mRowBuffer : null;
-
-        for (int y = 0; y < height; y += downscaleFactor)
-        {
+        for (int y = 0; y < height; y += SAMPLE_STEP) {
             final int rowStart = y * rowStride;
-            // [drmsample] Only probe every SAMPLE_STEP-th source row.
-            final boolean sampleRow = doSampling && (y % SAMPLE_STEP) == 0;
-
-            if (bulkRowRead)
-            {
-                // [deepseek] FAST PATH: read the whole padded-free RGBA row in one bulk get(); the
-                // [deepseek] inner loop then only touches the scratch row instead of the ByteBuffer.
-                buffer.position(rowStart);
-                buffer.get(row, 0, rowStride);
-            }
-
-            for (int x = 0, src = 0; x < width; x += downscaleFactor, src += pixelStride * downscaleFactor)
-            {
-                final byte r;
-                final byte g;
-                final byte b;
-                if (bulkRowRead) 
-                {
-                    // [deepseek] FAST PATH: pixel comes from the already materialized row buffer.
-                    r = row[src];
-                    g = row[src + 1];
-                    b = row[src + 2];
-                } 
-                else 
-                {
-                    // [deepseek] FALLBACK PATH: per-pixel absolute reads honour row padding and stride.
-                    final int pixelIndex = rowStart + src;
-                    r = buffer.get(pixelIndex);
-                    g = buffer.get(pixelIndex + 1);
-                    b = buffer.get(pixelIndex + 2);
-                }
-
-                out[outputIndex++] = r;
-                out[outputIndex++] = g;
-                out[outputIndex++] = b;
-
-                if (sampleRow && (x % SAMPLE_STEP) == 0) 
-                {
-                    final int rr = r & 0xFF;
-                    final int gg = g & 0xFF;
-                    final int bb = b & 0xFF;
-                    final int max = rr > gg ? (rr > bb ? rr : bb) : (gg > bb ? gg : bb);
-                    if (max > sampleMax) sampleMax = max;
-                    if (max > BLACK_SAMPLE_THRESHOLD) brightSamples++;
-                    sampleCount++;
-                }
+            for (int x = 0; x < width; x += SAMPLE_STEP) {
+                final int idx = rowStart + x * pixelStride;
+                final int rr = buffer.get(idx) & 0xFF;
+                final int gg = buffer.get(idx + 1) & 0xFF;
+                final int bb = buffer.get(idx + 2) & 0xFF;
+                final int max = rr > gg ? (rr > bb ? rr : bb) : (gg > bb ? gg : bb);
+                if (max > sampleMax) sampleMax = max;
+                if (max > BLACK_SAMPLE_THRESHOLD) brightSamples++;
+                sampleCount++;
             }
         }
 
         updateDrmState(sampleMax, brightSamples, sampleCount);
-        return out;
+    }
+
+    /**
+     * Lightweight DRM brightness probe over the already-copied RGB frame (~60 array reads in L1 cache),
+     * keeping the hot pixel-copy loop completely branch-free.
+     */
+    private void probeDrmFromRgb(byte[] rgb, int scaledWidth, int scaledHeight, int downscaleFactor) {
+        final int step = Math.max(1, SAMPLE_STEP / downscaleFactor);
+        int sampleMax = 0;
+        int brightSamples = 0;
+        int sampleCount = 0;
+
+        for (int y = 0; y < scaledHeight; y += step) {
+            final int rowOffset = y * scaledWidth * 3;
+            for (int x = 0; x < scaledWidth; x += step) {
+                final int idx = rowOffset + x * 3;
+                final int rr = rgb[idx] & 0xFF;
+                final int gg = rgb[idx + 1] & 0xFF;
+                final int bb = rgb[idx + 2] & 0xFF;
+                final int max = rr > gg ? (rr > bb ? rr : bb) : (gg > bb ? gg : bb);
+                if (max > sampleMax) sampleMax = max;
+                if (max > BLACK_SAMPLE_THRESHOLD) brightSamples++;
+                sampleCount++;
+            }
+        }
+
+        updateDrmState(sampleMax, brightSamples, sampleCount);
     }
 
     // [drmsample] --- DRM / protected-content detection --------------------------------
-    // [drmsample] Thresholds are intentionally conservative: a pixel is "not black" when its
-    // [drmsample] brightest channel is above BLACK_SAMPLE_THRESHOLD. The sum of all sampled pixels
-    // [drmsample] has to stay below BLACK_FRAME_MAX for a frame to count as black.
-    private static final int BLACK_SAMPLE_THRESHOLD = 24;
-    // [drmsample] Sampling stride in *source* pixels. 16 means every 16th row and every 16th
-    // [drmsample] column of the capture image is probed - on 1280x720 that is ~80x45 = 3600 probes
-    // [drmsample] out of 921k pixels, i.e. 0.4%.
+    // True DRM blackout from the compositor produces channel value 0; keep a tiny margin (4)
+    // so dark movie scenes do not falsely trigger the orange fallback.
+    private static final int BLACK_SAMPLE_THRESHOLD = 4;
+    // Sampling stride in *source* pixels.
     private static final int SAMPLE_STEP = 16;
-    // [drmsample] Number of consecutive black frames before the orange fallback kicks in.
-    // [drmsample] At 30 fps this is ~0.33 s, short enough to hide scene cuts (which have dark frames)
-    // [drmsample] and long enough not to react to a single fade frame.
+    // Require both a minimum frame count and 2.5 seconds of continuous true-black frames
+    // before switching to orange, so fades-to-black, scene cuts, and brief MStar decoder
+    // hiccups never cause 2-second orange flashes.
     private static final int BLACK_FRAMES_BEFORE_ORANGE = 10;
-    // [drmsample] Number of consecutive bright frames before returning to normal capture.
+    private static final long BLACK_DURATION_BEFORE_ORANGE_NS = 2_500_000_000L;
+    // Number of consecutive bright frames before returning to normal capture.
     private static final int BRIGHT_FRAMES_BEFORE_NORMAL = 3;
-    // [drmsample] Orange in RGB (255, 140, 0).
+    // Orange in RGB (255, 140, 0).
     private static final byte ORANGE_R = (byte) 0xFF;
     private static final byte ORANGE_G = (byte) 0x8C;
     private static final byte ORANGE_B = (byte) 0x00;
 
     private int mBlackFrameCount;
+    private long mBlackSinceNs;
     private int mBrightFrameCount;
     private boolean mSendingOrange;
-    // [drmsample] Orange frame buffer, reused; same size as the RGB frame buffers so sendFrame()
-    // [drmsample] can take the exact same width/height.
+    // Orange frame buffer, reused; same size as the RGB frame buffers.
     private byte[] mOrangeBuffer;
 
     /**
      * Updates the black/bright frame counters from one frame's sampling result and switches the
-     * DRM orange fallback on/off accordingly. Called from getPixels() with the values collected
-     * during the normal pixel copy, so no additional image pass is required.
-     *
-     * @param sampleMax    highest channel value seen in the sample grid
-     * @param brightSamples number of sampled pixels above BLACK_SAMPLE_THRESHOLD
-     * @param sampleCount  total number of sampled pixels
+     * DRM orange fallback on/off accordingly.
      */
     private void updateDrmState(int sampleMax, int brightSamples, int sampleCount) {
-        // [drmsample] Feature toggle from the settings screen. When disabled the counters stay at
-        // [drmsample] zero and sendImage() always forwards the real frame.
         if (!mDrmOrangeFallback) {
             mBlackFrameCount = 0;
+            mBlackSinceNs = 0L;
             mBrightFrameCount = 0;
             mSendingOrange = false;
             return;
@@ -480,14 +621,22 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
 
         if (black) {
             mBrightFrameCount = 0;
+            final long now = System.nanoTime();
+            if (mBlackFrameCount == 0) {
+                mBlackSinceNs = now;
+            }
             if (mBlackFrameCount < Integer.MAX_VALUE) mBlackFrameCount++;
-            if (!mSendingOrange && mBlackFrameCount >= BLACK_FRAMES_BEFORE_ORANGE) {
+            if (!mSendingOrange
+                    && mBlackFrameCount >= BLACK_FRAMES_BEFORE_ORANGE
+                    && (now - mBlackSinceNs) >= BLACK_DURATION_BEFORE_ORANGE_NS) {
                 mSendingOrange = true;
                 Log.i(TAG, "DRM fallback ON: " + mBlackFrameCount
-                        + " consecutive black frames (max channel " + sampleMax + "), sending orange");
+                        + " consecutive black frames over " + ((now - mBlackSinceNs) / 1_000_000L)
+                        + " ms (max channel " + sampleMax + "), sending orange");
             }
         } else {
             mBlackFrameCount = 0;
+            mBlackSinceNs = 0L;
             if (mSendingOrange) {
                 mBrightFrameCount++;
                 if (mBrightFrameCount >= BRIGHT_FRAMES_BEFORE_NORMAL) {
@@ -553,8 +702,7 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         return mAvgColorBuffer;
     }
 
-    private void sendImage(Image img) 
-    {
+    private void sendImage(Image img) {
         Image.Plane plane = img.getPlanes()[0];
         ByteBuffer buffer = plane.getBuffer();
 
@@ -562,39 +710,30 @@ public class HyperionScreenEncoder extends HyperionScreenEncoderBase {
         int height = img.getHeight();
         int pixelStride = plane.getPixelStride();
         int rowStride = plane.getRowStride();
-        int firstX = 0;
-        int firstY = 0;        
 
-        // if (mRemoveBorders || mAvgColor) {
-        //     mBorderProcessor.parseBorder(buffer, width, height, rowStride, pixelStride);
-        //     BorderProcessor.BorderObject border = mBorderProcessor.getCurrentBorder();
-        //     if (border != null && border.isKnown()) {
-        //         firstX = border.getHorizontalBorderIndex();
-        //         firstY = border.getVerticalBorderIndex();
-        //     }
-        // }
-
-                // if (mAvgColor) {
-        //     mListener.sendFrame(
-        //             getAverageColor(buffer, width, height, rowStride, pixelStride, firstX, firstY),
-        //             1,
-        //             1
-        //     );
-        // } else 
-        {                     
-            // [drmsample] Always run the pixel copy: it updates the black/bright counters that
-            // [drmsample] drive the DRM fallback, so the detection costs nothing extra here.
-            final byte[] pixels = getPixels(buffer, width, height, rowStride, pixelStride, mDownscaleFactor);
-
-            // [drmsample] While a protected (DRM) layer hides the real content, the compositor only
-            // [drmsample] hands us black frames. In that case send a solid orange image instead of
-            // [drmsample] the meaningless black frame, so the LEDs show a defined state rather than
-            // [drmsample] staying dark.
+        // Fast path while DRM orange fallback is active: only probe the ~60 sample pixels
+        // instead of copying the entire frame into RGB.
+        boolean drmProbed = false;
+        if (mDrmOrangeFallback && mSendingOrange) {
+            probeDrmDirect(buffer, width, height, rowStride, pixelStride);
+            drmProbed = true;
             if (isSendingOrange()) {
-                mListener.sendFrame(getOrangeBuffer(), mScaledWidth, mScaledHeight);
-            } else {
-                mListener.sendFrame(pixels, mScaledWidth, mScaledHeight);
+                mListener.sendFrame(getOrangeBuffer(), mScaledWidth, mScaledHeight, false);
+                return;
             }
+        }
+
+        final byte[] out = mCaptureBuffer;
+        getPixels(buffer, out, width, height, rowStride, pixelStride, mDownscaleFactor);
+
+        if (mDrmOrangeFallback && !drmProbed) {
+            probeDrmFromRgb(out, mScaledWidth, mScaledHeight, mDownscaleFactor);
+        }
+
+        if (isSendingOrange()) {
+            mListener.sendFrame(getOrangeBuffer(), mScaledWidth, mScaledHeight, false);
+        } else {
+            mCaptureBuffer = mListener.sendFrame(out, mScaledWidth, mScaledHeight, true);
         }
     }
 }

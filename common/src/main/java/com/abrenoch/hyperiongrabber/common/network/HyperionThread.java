@@ -1,87 +1,112 @@
 package com.abrenoch.hyperiongrabber.common.network;
 
 import com.abrenoch.hyperiongrabber.common.HyperionScreenService;
-import com.abrenoch.hyperiongrabber.common.HyperionProto;
 
 import java.io.IOException;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Dedicated background thread responsible for socket connection, reconnection,
  * and asynchronous frame transmission to Hyperion.
- * Decoupled from the screen capture pipeline to ensure screen capture never stalls.
+ * Uses a zero-allocation triple-buffer handoff so screen capture never stalls
+ * and never races with network serialization.
  */
 public class HyperionThread extends Thread {
     private final String HOST;
     private final int PORT;
     private final int PRIORITY;
     private final int FRAME_DURATION = -1;
-    private boolean RECONNECT = false;
-    // [deepseek] Removed the HAS_CONNECTED flag: it made the first connect attempt a special case,
-    // [deepseek] which is exactly what broke the boot scenario. RECONNECT alone now decides whether
-    // [deepseek] the worker keeps retrying.
+    private final boolean RECONNECT;
     private final int RECONNECT_DELAY;
-    private Hyperion mHyperion;
+
+    private volatile Hyperion mHyperion;
     private volatile boolean mRunning = true;
+    private volatile boolean mConnected = false;
 
-    // Single-slot queue: Holds at most one pending frame.
-    // If the network is slow, older unconsumed frames are dropped immediately to eliminate latency accumulation.
-    private final ArrayBlockingQueue<Frame> mFrameQueue = new ArrayBlockingQueue<>(1);
+    // Lightweight monitor held only for nanosecond-scale reference swaps (never during socket I/O)
+    private final Object mQueueLock = new Object();
+    private byte[] mPendingData;
+    private int mPendingWidth;
+    private int mPendingHeight;
+    private boolean mPendingReusable;
+    private boolean mHasPendingFrame;
+    private boolean mClearRequested;
 
-    private static class Frame {
-        final byte[] data;
-        final int width;
-        final int height;
-
-        Frame(byte[] data, int width, int height) {
-            this.data = data;
-            this.width = width;
-            this.height = height;
-        }
-    }
+    // 2-slot free pool for triple-buffering (3rd buffer is held by capture or network thread)
+    private byte[] mFree0;
+    private byte[] mFree1;
+    private int mExpectedBufferLength;
 
     HyperionScreenService.HyperionThreadBroadcaster mSender;
     HyperionThreadListener mReceiver = new HyperionThreadListener() {
         @Override
-        public void sendFrame(byte[] data, int width, int height) {
-            if (!mRunning || mHyperion == null || !mHyperion.isConnected()) {
-                return;
+        public boolean isConnected() {
+            return mRunning && mConnected;
+        }
+
+        @Override
+        public void initBuffers(byte[] free0, byte[] free1) {
+            synchronized (mQueueLock) {
+                mExpectedBufferLength = free0 != null ? free0.length : 0;
+                mFree0 = free0;
+                mFree1 = free1;
+                mPendingData = null;
+                mHasPendingFrame = false;
+                mPendingReusable = false;
+            }
+        }
+
+        @Override
+        public byte[] sendFrame(byte[] data, int width, int height, boolean reusable) {
+            if (!mRunning || !mConnected) {
+                return reusable ? data : null;
             }
 
-            // [deepseek] Non-blocking hand-off: the encoder gives us a ping-pong buffer that it will
-            // [deepseek] not touch again until the next frame, so no defensive clone() is needed.
-            Frame frame = new Frame(data, width, height);
+            synchronized (mQueueLock) {
+                if (mHasPendingFrame && mPendingReusable) {
+                    pushFreeLocked(mPendingData);
+                }
+                mPendingData = data;
+                mPendingWidth = width;
+                mPendingHeight = height;
+                mPendingReusable = reusable;
+                mHasPendingFrame = true;
+                mQueueLock.notify();
 
-            // Discard any older unsent frame and offer the newest frame to the network worker
-            mFrameQueue.poll();
-            mFrameQueue.offer(frame);
+                if (reusable) {
+                    byte[] next = popFreeLocked();
+                    return next != null ? next : new byte[data.length];
+                }
+                return null;
+            }
         }
 
         @Override
         public void clear() {
-            if (mHyperion != null && mHyperion.isConnected()) {
-                try {
-                    mHyperion.clear(PRIORITY);
-                } catch (IOException e) {
-                    if (mSender != null) {
-                        mSender.onConnectionError(e.hashCode(), e.getMessage());
-                    }
-                    e.printStackTrace();
+            synchronized (mQueueLock) {
+                if (mHasPendingFrame && mPendingReusable) {
+                    pushFreeLocked(mPendingData);
                 }
+                mPendingData = null;
+                mHasPendingFrame = false;
+                mPendingReusable = false;
+                mClearRequested = true;
+                mQueueLock.notify();
             }
         }
 
         @Override
         public void disconnect() {
             mRunning = false;
+            mConnected = false;
+            synchronized (mQueueLock) {
+                mQueueLock.notifyAll();
+            }
             interrupt();
-            if (mHyperion != null) {
+            Hyperion h = mHyperion;
+            if (h != null) {
                 try {
-                    mHyperion.disconnect();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
+                    h.disconnect();
+                } catch (IOException ignored) {}
             }
         }
 
@@ -93,8 +118,28 @@ public class HyperionThread extends Thread {
         }
     };
 
+    private void pushFreeLocked(byte[] buf) {
+        if (buf == null || buf.length != mExpectedBufferLength) return;
+        if (mFree0 == null) {
+            mFree0 = buf;
+        } else if (mFree1 == null) {
+            mFree1 = buf;
+        }
+    }
+
+    private byte[] popFreeLocked() {
+        if (mFree0 != null) {
+            byte[] b = mFree0;
+            mFree0 = mFree1;
+            mFree1 = null;
+            return b;
+        }
+        return null;
+    }
+
     public HyperionThread(HyperionScreenService.HyperionThreadBroadcaster listener, final String host,
                           final int port, final int priority, final boolean reconnect, final int delay) {
+        super("HyperionNetwork");
         HOST = host;
         PORT = port;
         PRIORITY = priority;
@@ -110,29 +155,38 @@ public class HyperionThread extends Thread {
     @Override
     public void interrupt() {
         mRunning = false;
+        mConnected = false;
+        synchronized (mQueueLock) {
+            mQueueLock.notifyAll();
+        }
         super.interrupt();
+        Hyperion h = mHyperion;
+        if (h != null) {
+            try {
+                h.disconnect();
+            } catch (IOException ignored) {}
+        }
     }
 
     @Override
     public void run() {
         while (mRunning && !isInterrupted()) {
             // 1. Establish or re-establish connection if disconnected
-            if (mHyperion == null || !mHyperion.isConnected()) {
+            Hyperion hyperion = mHyperion;
+            if (hyperion == null || !hyperion.isConnected()) {
+                mConnected = false;
                 try {
-                    mHyperion = new Hyperion(HOST, PORT);
+                    hyperion = new Hyperion(HOST, PORT);
+                    mHyperion = hyperion;
+                    mConnected = true;
                     if (mSender != null) {
                         mSender.onConnected();
                     }
                 } catch (IOException e) {
+                    mConnected = false;
                     if (mSender != null) {
                         mSender.onConnectionError(e.hashCode(), e.getMessage());
                     }
-                    // [deepseek] Retry no matter whether a connection ever succeeded. The old guard was
-                    // [deepseek] "RECONNECT && HAS_CONNECTED", so a failure on the very first attempt
-                    // [deepseek] (TV boots before the Hyperion server is reachable) dropped out of the
-                    // [deepseek] loop and killed the thread for good. Together with "start on boot" the
-                    // [deepseek] grabber then stayed dark until the app was restarted by hand, even
-                    // [deepseek] though RECONNECT was enabled.
                     if (!RECONNECT) break;
                     try {
                         Thread.sleep(RECONNECT_DELAY);
@@ -143,52 +197,84 @@ public class HyperionThread extends Thread {
                 }
             }
 
-            // 2. Wait for the next frame from the capture pipeline (non-busy wait with timeout)
-            Frame frame;
-            try {
-                frame = mFrameQueue.poll(100, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                break;
+            // 2. Wait for the next frame or clear command without polling wakeups
+            byte[] data = null;
+            int width = 0;
+            int height = 0;
+            boolean reusable = false;
+            boolean doClear = false;
+
+            synchronized (mQueueLock) {
+                while (mRunning && !isInterrupted() && !mHasPendingFrame && !mClearRequested) {
+                    try {
+                        mQueueLock.wait();
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+                if (!mRunning || isInterrupted()) break;
+
+                if (mClearRequested) {
+                    doClear = true;
+                    mClearRequested = false;
+                } else if (mHasPendingFrame) {
+                    data = mPendingData;
+                    width = mPendingWidth;
+                    height = mPendingHeight;
+                    reusable = mPendingReusable;
+                    mPendingData = null;
+                    mHasPendingFrame = false;
+                    mPendingReusable = false;
+                }
             }
 
-            // 3. Serialize and transmit frame over socket on this background thread
-            if (frame != null && mHyperion != null && mHyperion.isConnected()) {
+            // 3. Transmit over socket outside mQueueLock
+            try {
+                if (doClear) {
+                    hyperion.clear(PRIORITY);
+                } else if (data != null) {
+                    hyperion.setImageRaw(data, data.length, width, height, PRIORITY, FRAME_DURATION);
+                }
+            } catch (IOException e) {
+                mConnected = false;
+                if (mSender != null) {
+                    mSender.onConnectionError(e.hashCode(), e.getMessage());
+                }
                 try {
-                    HyperionProto.HyperionRequest req =
-                            Hyperion.setImageRequest(frame.data, frame.width, frame.height, PRIORITY, FRAME_DURATION);
-                    mHyperion.sendRequest(req);
-                } catch (IOException e) {
-                    if (mSender != null) {
-                        mSender.onConnectionError(e.hashCode(), e.getMessage());
-                    }
-                    try {
-                        mHyperion.disconnect();
-                    } catch (Exception ignored) {}
-                    mHyperion = null;
+                    hyperion.disconnect();
+                } catch (Exception ignored) {}
+                mHyperion = null;
 
-                    // Reconnection delay runs here on the network worker, avoiding stalls on the capture thread
-                    // [deepseek] Same rule as in the connect block above: only RECONNECT decides.
-                    if (!RECONNECT) break;
-                    try {
-                        Thread.sleep(RECONNECT_DELAY);
-                    } catch (InterruptedException ie) {
-                        break;
+                if (!RECONNECT) break;
+                try {
+                    Thread.sleep(RECONNECT_DELAY);
+                } catch (InterruptedException ie) {
+                    break;
+                }
+            } finally {
+                if (reusable && data != null) {
+                    synchronized (mQueueLock) {
+                        pushFreeLocked(data);
                     }
                 }
             }
         }
 
         // Cleanup on thread shutdown
-        if (mHyperion != null) {
+        mConnected = false;
+        Hyperion h = mHyperion;
+        if (h != null) {
             try {
-                mHyperion.disconnect();
+                h.disconnect();
             } catch (Exception ignored) {}
             mHyperion = null;
         }
     }
 
     public interface HyperionThreadListener {
-        void sendFrame(byte[] data, int width, int height);
+        boolean isConnected();
+        void initBuffers(byte[] free0, byte[] free1);
+        byte[] sendFrame(byte[] data, int width, int height, boolean reusable);
         void clear();
         void disconnect();
         void sendStatus(boolean isGrabbing);

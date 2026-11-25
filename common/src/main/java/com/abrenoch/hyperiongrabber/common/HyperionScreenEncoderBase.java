@@ -35,11 +35,10 @@ public class HyperionScreenEncoderBase {
     final int mCaptureWidth;
     final int mCaptureHeight;
     final int mDensity;
-    boolean mIsCapturing = false;
+    volatile boolean mIsCapturing = false;
     int mCurrentOrientation;
     final int mDownscaleFactor;
 
-    BorderProcessor mBorderProcessor;
     Handler mHandler;
     MediaProjection mMediaProjection;
     HyperionThread.HyperionThreadListener mListener;
@@ -53,13 +52,10 @@ public class HyperionScreenEncoderBase {
         mMediaProjection = projection;
         mDensity = density;
         mFrameRate = options.getFrameRate();
-                mAvgColor = options.useAverageColor();
+        mAvgColor = options.useAverageColor();
         String resolution = options.Resolution();
         mUseLegacyImageReader = options.useLegacyImageReader();
         mDrmOrangeFallback = options.useDrmOrangeFallback();
-
-        int blackThreshold = options.getBlackThreshold();
-        mBorderProcessor = new BorderProcessor(blackThreshold);
 
         mCurrentOrientation = INIT_ORIENTATION = width > height ? Configuration.ORIENTATION_LANDSCAPE :
                 Configuration.ORIENTATION_PORTRAIT;
@@ -115,7 +111,6 @@ public class HyperionScreenEncoderBase {
             Log.d(TAG, "Capture Width: " + String.valueOf(mCaptureWidth));
             Log.d(TAG, "Capture Height: " + String.valueOf(mCaptureHeight));
             Log.d(TAG, "Average Color Only: " + String.valueOf(mAvgColor));
-            Log.d(TAG, "Black Pixel Threshold: " + String.valueOf(blackThreshold));
         }
 
         if (DEBUG) {
@@ -135,37 +130,16 @@ public class HyperionScreenEncoderBase {
         if (DEBUG) Log.d(TAG, "Encoder ready");
     }
 
-    private Runnable clearAndDisconnectRunner = new Runnable() {
-        public void run() {
-            if (DEBUG) Log.d(TAG, "Clearing LEDs and disconnecting");
-            try {
-                Thread.sleep(CLEAR_COMMAND_DELAY_MS);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-            mListener.clear();
-            mListener.disconnect();
-        }
-    };
-
-    private Runnable clearLightsRunner = new Runnable() {
-        public void run() {
-            if (DEBUG) Log.d(TAG, "Clearing LEDs");
-            try {
-                Thread.sleep(CLEAR_COMMAND_DELAY_MS);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-            mListener.clear();
-        }
-    };
-
     public void clearLights() {
-        new Thread(clearLightsRunner).start();
+        if (mListener != null) {
+            mListener.clear();
+        }
     }
 
     void clearAndDisconnect() {
-        new Thread(clearAndDisconnectRunner).start();
+        if (mListener != null) {
+            mListener.disconnect();
+        }
     }
 
     public boolean isCapturing() {
